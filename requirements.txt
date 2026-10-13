@@ -1,0 +1,6 @@
+streamlit==1.65.0
+langgraph
+langchain-core
+langchain-openai
+openai
+requests

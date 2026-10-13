@@ -1,0 +1,33 @@
+# 密钥配置（绝不能上传）
+.env
+
+# Python 虚拟环境
+.venv/
+__pycache__/
+*.pyc
+
+# 持久化数据库与本地产物
+agent_memory.db
+agent_memory.db-shm
+agent_memory.db-wal
+memos.md
+
+# 会话与计划数据（含隐私聊天内容）
+sessions.json
+plans.json
+
+# 本地临时诊断文件
+_align_check.png
+_diag.txt
+_temp_diag.py
+_ver.txt
+
+# 启动/停止脚本（含本机绝对路径）
+*.bat
+
+# IDE
+.idea/
+.vscode/
+
+# RAG 知识库
+kb/
