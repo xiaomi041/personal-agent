@@ -1458,6 +1458,28 @@ def register_session(thread_id: str, title: str) -> None:
             "thread_id": thread_id,
             "created_at": now,
             "title": title[:24] if title else "新会话",
+            "pinned": False,
+        }
+    )
+    _save_sessions(recs)
+
+
+def set_pinned(thread_id: str, pinned: bool) -> None:
+    """置顶 / 取消置顶一个会话。"""
+    recs = _load_sessions()
+    for r in recs:
+        if r["thread_id"] == thread_id:
+            r["pinned"] = pinned
+            _save_sessions(recs)
+            return
+    from datetime import datetime
+
+    recs.append(
+        {
+            "thread_id": thread_id,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "title": "新会话",
+            "pinned": pinned,
         }
     )
     _save_sessions(recs)
@@ -1480,7 +1502,8 @@ def list_sessions() -> list:
                 known.add(tid)
     except Exception:
         pass
-    recs.sort(key=lambda r: r.get("created_at", ""), reverse=True)
+    # 置顶会话优先，组内按创建时间倒序
+    recs.sort(key=lambda r: (not r.get("pinned", False), r.get("created_at", "")), reverse=True)
     return recs
 
 
