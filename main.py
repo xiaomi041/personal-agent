@@ -635,21 +635,25 @@ def _extract_text(name: str, content: bytes) -> str:
 
 
 def _chunk_text(text: str, size: int = 350, overlap: int = 40) -> list:
-    """按字符长度切块，优先在换行处断开，保留少量重叠。"""
+    """按段落切块：每个段落作为完整语义单元；超长段落再按 size 字 + overlap 重叠续切。"""
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     if not text:
         return []
-    chunks, start = [], 0
-    while start < len(text):
-        end = min(start + size, len(text))
-        if end < len(text):
-            cut = text.rfind("\n", start + int(size * 0.6), end)
-            if cut > start:
-                end = cut
-        chunks.append(text[start:end].strip())
-        if end >= len(text):
-            break
-        start = max(end - overlap, start + 1)
+    chunks = []
+    for para in re.split(r"\n\s*\n", text):
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) <= size:
+            chunks.append(para)
+            continue
+        start = 0
+        while start < len(para):
+            end = min(start + size, len(para))
+            chunks.append(para[start:end].strip())
+            if end >= len(para):
+                break
+            start = max(end - overlap, start + 1)
     return [c for c in chunks if c]
 
 
@@ -666,6 +670,7 @@ def _load_kb():
     # 兼容旧数据：没有会话归属的记录归到 user-main
     for c in chunks:
         c.setdefault("thread_id", "user-main")
+        c.setdefault("idx", 0)
     for d in docs:
         d.setdefault("thread_id", "user-main")
     return chunks, vecs, docs
@@ -688,7 +693,10 @@ def add_document(filename: str, content: bytes, thread_id: str = "user-main") ->
     chunks = _chunk_text(text)
     vecs_new = np.array(_embed_texts(chunks), dtype="float32")
     chunks_old, vecs_old, docs = _load_kb()
-    chunks_old.extend({"thread_id": thread_id, "doc": filename, "text": c} for c in chunks)
+    chunks_old.extend(
+        {"thread_id": thread_id, "doc": filename, "idx": i, "text": c}
+        for i, c in enumerate(chunks)
+    )
     vecs = np.vstack([vecs_old, vecs_new]) if len(vecs_old) else vecs_new
     docs = [d for d in docs if not (d["thread_id"] == thread_id and d["name"] == filename)]
     docs.append(
@@ -750,6 +758,7 @@ def search_documents(query: str, top_k: int = 5, thread_id: str = None) -> list:
     return [
         {
             "doc": chunks[i]["doc"],
+            "idx": chunks[i].get("idx", 0),
             "text": chunks[i]["text"],
             "score": float(scores[i]),
         }
@@ -771,8 +780,8 @@ def ask_document(query: str) -> str:
         f"文档片段：\n{ctx}\n\n用户问题：{query}\n\n回答："
     )
     resp = deepseek_model().invoke([HumanMessage(content=prompt)])
-    src = "、".join(dict.fromkeys(h["doc"] for h in hits))
-    return f"{resp.content}\n\n（依据文档：《{src}》）"
+    src = "、".join(dict.fromkeys(f"《{h['doc']}》片段#{h.get('idx', 0)}" for h in hits))
+    return f"{resp.content}\n\n（依据：{src}）"
 
 
 # ========== 定时提醒 / 自动任务（自研调度线程 + SQLite 持久化） ==========
