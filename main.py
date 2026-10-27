@@ -49,6 +49,8 @@ def deepseek_model():
         api_key=DEEPSEEK_KEY,
         base_url="https://api.deepseek.com",
         temperature=0.3,
+        timeout=60,      # 单次请求超时，避免网络抖动时整个委托卡死
+        max_retries=2,   # 429/5xx/连接错误由 SDK 自动退避重试
     )
 
 
@@ -58,6 +60,8 @@ def qwen_model():
         api_key=QWEN_KEY,
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         temperature=0.2,
+        timeout=60,
+        max_retries=2,
     )
 
 
@@ -622,13 +626,20 @@ def _embed_texts(texts: list) -> list:
     out = []
     for i in range(0, len(texts), 10):
         batch = texts[i : i + 10]
-        resp = requests.post(
-            EMBED_URL,
-            headers={"Authorization": f"Bearer {QWEN_KEY}"},
-            json={"model": EMBED_MODEL, "input": batch},
-            timeout=60,
-        )
-        resp.raise_for_status()
+        for attempt in range(3):  # 向量化接口偶发超时/限流：最多重试 2 次（1s、2s 退避）
+            try:
+                resp = requests.post(
+                    EMBED_URL,
+                    headers={"Authorization": f"Bearer {QWEN_KEY}"},
+                    json={"model": EMBED_MODEL, "input": batch},
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                break
+            except requests.RequestException:
+                if attempt == 2:
+                    raise
+                _time.sleep(1 + attempt)
         data = resp.json()["data"]
         data.sort(key=lambda d: d["index"])
         out.extend(d["embedding"] for d in data)
