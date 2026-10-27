@@ -34,6 +34,20 @@ DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 QWEN_KEY = os.getenv("QWEN_API_KEY", "")
 
 BASE_DIR = Path(__file__).parent
+
+# 日志写到 agent.log（滚动，最多约 3MB）。原先后台线程和工具里的异常大多被静默吞掉，出问题无从查起
+import logging
+from logging.handlers import RotatingFileHandler
+
+log = logging.getLogger("agent")
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    try:
+        _fh = RotatingFileHandler(BASE_DIR / "agent.log", maxBytes=1_000_000, backupCount=2, encoding="utf-8")
+        _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        log.addHandler(_fh)
+    except OSError:
+        log.addHandler(logging.NullHandler())
 DB_FILE = BASE_DIR / "agent_memory.db"
 # 备忘写到桌面，打开桌面就能看到
 MEMO_FILE = Path(os.path.expanduser("~/Desktop")) / "memos.md"
@@ -1106,6 +1120,7 @@ def _check_due():
                 preview = "\n".join(rest.split("\n")[:3])
                 alert_text = f"📅 今日日报已生成\n{head}\n{preview}..."
             except Exception as e:
+                log.exception("定时日报生成失败")
                 alert_text = f"📅 日报生成失败：{e}"
         conn.execute(
             "INSERT INTO alerts (content, fired_at) VALUES (?,?)",
@@ -1142,7 +1157,7 @@ def start_scheduler():
             try:
                 _check_due()
             except Exception:
-                pass
+                log.exception("调度循环出错")
             _time.sleep(5)
 
     import threading
@@ -1421,6 +1436,7 @@ def _run_tool_loop(model, messages, max_iters=6):
                 try:
                     result = fn.invoke(tc["args"])
                 except Exception as e:
+                    log.exception("工具 %s 执行出错", tc["name"])
                     result = f"工具执行出错：{e}"
                 messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
             trace.append(f"调用 {tc['name']}({tc['args']}) -> {result}")

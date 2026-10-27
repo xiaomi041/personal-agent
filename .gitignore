@@ -23,6 +23,7 @@ _diag.txt
 _temp_diag.py
 _ver.txt
 _alert_http.log
+agent.log*
 
 # 启动/停止脚本（含本机绝对路径）
 *.bat
