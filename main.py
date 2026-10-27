@@ -1386,6 +1386,9 @@ def _last_user_task(state) -> str:
     return ""
 
 
+MAX_CONTEXT_TURNS = 12  # 给各节点的历史上下文最多带最近 N 轮问答（完整历史仍在数据库里）
+
+
 def _build_context(state) -> str:
     """把整个会话的对话（用户问 + 助手答）整理成文本，让 planner/executor 能理解多轮指代。
     跳过 [规划]/[评审] 等内部节点消息和工具调用噪音，只保留问答主干。"""
@@ -1405,6 +1408,7 @@ def _build_context(state) -> str:
                 ans = [c]  # 保留该轮最后一条真实答复
     if user is not None:
         pairs.append((user, ans[-1] if ans else None))
+    pairs = pairs[-MAX_CONTEXT_TURNS:]
     lines = []
     for u, a in pairs:
         lines.append(f"用户：{u}")
@@ -1679,6 +1683,25 @@ def delete_session(thread_id: str) -> None:
         conn.close()
     except Exception:
         pass
+
+
+def purge_empty_sessions(keep: str = "") -> int:
+    """清掉从未发过消息的空会话记录（点了“新开会话”却没用）。keep=当前正在用的会话，置顶会话也保留。
+    只删 sessions.json 里的索引条目，不碰对话数据。返回清掉的条数。"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            rows = conn.execute("SELECT DISTINCT thread_id FROM checkpoints").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+    used = {t.decode() if isinstance(t, bytes) else str(t) for (t,) in rows}
+    recs = _load_sessions()
+    kept = [r for r in recs if r["thread_id"] in used or r["thread_id"] == keep or r.get("pinned")]
+    if len(kept) != len(recs):
+        _save_sessions(kept)
+    return len(recs) - len(kept)
 
 
 # ========== 会话操作标签（[备忘] / [PPT] / [天气] ...） ==========

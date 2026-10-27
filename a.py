@@ -141,6 +141,7 @@ with st.sidebar:
                 st.session_state.manage_mode = not manage
                 st.rerun()
 
+        main.purge_empty_sessions(keep=st.session_state.thread_id)  # 清掉没用过的空会话
         sessions = main.list_sessions()
         current_tid = st.session_state.thread_id
 
