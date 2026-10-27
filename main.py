@@ -1095,6 +1095,40 @@ def _advance_at(at: str, repeat: str):
     return at
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _notify_desktop(title: str, text: str) -> None:
+    """Windows 系统通知（toast）：提醒到点时不依赖网页是否有交互。
+    仅 Windows 生效；失败只记日志，不影响提醒本身。设环境变量 AGENT_DESKTOP_NOTIFY=0 可关闭。"""
+    if not _is_windows() or os.getenv("AGENT_DESKTOP_NOTIFY", "1") == "0":
+        return
+    try:
+        import subprocess
+
+        def q(x: str) -> str:  # PowerShell 单引号字符串：单引号写两次即转义，其余字符都按字面量处理
+            return x.replace("\n", " ").replace("'", "''")[:200]
+
+        script = (
+            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
+            "$t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
+            "$n = $t.GetElementsByTagName('text');"
+            f"$n.Item(0).AppendChild($t.CreateTextNode('{q(title)}')) > $null;"
+            f"$n.Item(1).AppendChild($t.CreateTextNode('{q(text)}')) > $null;"
+            "$toast = [Windows.UI.Notifications.ToastNotification]::new($t);"
+            r"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe').Show($toast)"
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
+    except Exception:
+        log.warning("系统通知发送失败", exc_info=True)
+
+
 def _check_due():
     from datetime import timedelta
 
@@ -1126,6 +1160,7 @@ def _check_due():
             "INSERT INTO alerts (content, fired_at) VALUES (?,?)",
             (alert_text, fired_at),
         )
+        _notify_desktop("⏰ 眯哥委托智能体", alert_text)
         try:
             with open(MEMO_FILE, "a", encoding="utf-8") as f:
                 f.write(f"- [提醒 {fired_at}] {alert_text}\n")
