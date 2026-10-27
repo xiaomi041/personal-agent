@@ -15,12 +15,14 @@ memos.md
 # 会话与计划数据（含隐私聊天内容）
 sessions.json
 plans.json
+todos.json
 
 # 本地临时诊断文件
 _align_check.png
 _diag.txt
 _temp_diag.py
 _ver.txt
+_alert_http.log
 
 # 启动/停止脚本（含本机绝对路径）
 *.bat

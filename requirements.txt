@@ -1,6 +1,12 @@
 streamlit==1.65.0
 langgraph
+langgraph-checkpoint-sqlite
 langchain-core
 langchain-openai
 openai
 requests
+python-dotenv
+numpy
+python-docx
+python-pptx
+pypdf
