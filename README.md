@@ -10,8 +10,8 @@
   - **Executor**（DeepSeek）：函数调用循环调度工具（单次最多 6 轮），记录执行证据链
   - **Critic**（Qwen）：独立评审执行结果，不合格自动返工重做（最多 2 轮），保证回答质量
 - **💾 SQLite Checkpoint 断点续接** —— 对话状态持久化到本地 SQLite，服务重启不丢上下文；多会话独立记忆，互不串扰
-- **📚 RAG 文档分析** —— 上传 PDF / Word / 图片 → 文本解析提取 → 段落切块（超长段按 350 字 + 40 字重叠续切）→ Embedding 向量化入库 → 语义相似度检索 → 注入上下文问答总结，**答案自动溯源到具体片段**（「依据：《文档》片段#N」）
-- **⏰ 定时调度与提醒** —— 自建 `threading` 后台调度器（30 秒轮询 SQLite 提醒任务）+ 本地 HTTP 提醒服务（端口 8600），到点前端弹窗强制确认；支持一次性 / 周期提醒
+- **📚 RAG 文档分析** —— 上传 PDF / Word / TXT / Markdown → 文本解析提取 → 段落切块（超长段按 350 字 + 40 字重叠续切）→ Embedding 向量化入库 → 语义相似度检索 → 注入上下文问答总结，**答案自动溯源到具体片段**（「依据：《文档》片段#N」）
+- **⏰ 定时调度与提醒** —— 自建 `threading` 后台调度器（5 秒轮询 SQLite 提醒任务，once 提醒精确到秒，周期提醒同一分钟只触发一次）+ 本地 HTTP 提醒服务（端口 8600），到点后页面弹窗强制确认（页面有交互时触发），Windows 下同时发系统通知（`AGENT_DESKTOP_NOTIFY=0` 可关闭）；支持一次性 / 周期提醒
 - **📊 日报自动聚合** —— 一键生成今日日报：天气（按城市）+ 待办清单 + 备忘 + 知识沉淀，可定时每天自动生成
 - **🌐 联网搜索 → 知识库** —— 内置搜索工具，查到的资料自动整理沉淀进知识库，后续可直接问答
 - **🖥️ Streamlit 界面** —— 侧边栏会话管理（新建 / 回访 / 置顶 / 搜索 / 删除）+ 四分区工作台：会话 / 待办 / 任务计划 / 文档
@@ -99,6 +99,7 @@ streamlit run a.py --server.port 8501
 personal-agent/
 ├── main.py            # 核心：状态图（Planner/Executor/Critic）+ 18 个工具 + RAG + 调度器
 ├── a.py               # Streamlit 界面（侧边栏会话管理 + 四分区工作台）
+├── assets/logo.png    # 界面 logo
 ├── kb/                # RAG 知识库（chunks.json / vectors.npy / docs.json，按会话私有）
 ├── agent_memory.db    # SQLite：对话 checkpoint + 提醒任务（git 忽略）
 ├── sessions.json      # 会话索引（git 忽略）
@@ -106,8 +107,23 @@ personal-agent/
 ├── .env               # API 密钥（git 忽略，请勿上传）
 ├── .env.example       # 配置模板
 ├── requirements.txt   # 依赖清单
+├── tests/test_agent.py # 自动化测试（不联网、不动真实数据）
+├── agent.log          # 运行日志（滚动，git 忽略）
 ├── 启动.bat / 停止.bat # Windows 一键启停脚本（本地使用，git 忽略）
 ```
+
+## 🧪 测试
+
+```bash
+python -m unittest discover -s tests -v   # 或：pytest tests -v
+```
+
+测试使用临时目录和假的模型/向量化接口，不联网、不消耗额度、不会改动你的真实对话和待办。
+
+## 🔧 维护
+
+- **排查问题**：后台调度、工具调用、日报生成的异常会写进项目目录下的 `agent.log`。
+- **数据库瘦身**：`agent_memory.db` 每个 checkpoint 存完整状态，会越长越大。停掉 Streamlit 后运行 `python -c "import main; print(main.prune_checkpoints())"`，每个会话只保留最近 3 个 checkpoint，不影响对话续接。
 
 ## 🛠️ 技术栈
 
