@@ -70,7 +70,7 @@ def get_today() -> str:
     now = datetime.now()
     wd = "一二三四五六日"[now.weekday()]
     return (
-        f"现在 {now.strftime('%Y-%m-%d %H:%M')} 星期{wd}；"
+        f"现在 {now.strftime('%Y-%m-%d %H:%M:%S')} 星期{wd}；"
         f"明天 {(now.date() + timedelta(days=1)).isoformat()}；"
         f"后天 {(now.date() + timedelta(days=2)).isoformat()}"
     )
@@ -174,6 +174,18 @@ def _auto_pptx_pages(content: str) -> list:
     return [cover] + pages  # 第一页封面 + 后续内容页
 
 
+def _unique_path(p: Path) -> Path:
+    """目标已存在时自动加 (1)(2)... 后缀，避免静默覆盖已有文件；同时确保目录存在。"""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not p.exists():
+        return p
+    for i in range(1, 100):
+        cand = p.with_name(f"{p.stem}({i}){p.suffix}")
+        if not cand.exists():
+            return cand
+    return p
+
+
 def _save_with_fallback(out: Path, saver) -> Path:
     """保存文件；若目标被占用（如正在 WPS 中打开）则自动用 名称(1).后缀 重试。"""
     try:
@@ -201,7 +213,11 @@ def write_file(filename: str, content: str) -> str:
     from docx import Document
     from pptx import Presentation
 
-    out = Path(os.path.expanduser("~/Desktop")) / filename
+    # 只保留文件名部分：丢弃模型/网页可能带来的绝对路径或 ../，文件只会落在桌面
+    safe_name = Path(str(filename).replace("\\", "/")).name
+    if not safe_name:
+        return "文件名无效"
+    out = _unique_path(Path(os.path.expanduser("~/Desktop")) / safe_name)
     ext = out.suffix.lower()
 
     if ext in (".txt", ".md", ".csv", ".json", ".log"):
@@ -588,7 +604,14 @@ KB_VECS = KB_DIR / "vectors.npy"     # numpy 矩阵（行 = 片段）
 KB_DOCS = KB_DIR / "docs.json"       # [{thread_id, name, chunk_count, created_at}]
 
 # 当前执行会话（executor 节点设置，工具按此隔离知识库）
-_ACTIVE_THREAD = None
+# 用 threading.local 而不是全局变量：多个浏览器标签同时运行时互不串会话
+import threading
+
+_ctx = threading.local()
+
+
+def _active_thread() -> str:
+    return getattr(_ctx, "thread_id", None) or "user-main"
 
 EMBED_MODEL = "text-embedding-v3"
 EMBED_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/embeddings"
@@ -677,14 +700,35 @@ def _load_kb():
 
 
 def _save_kb(chunks, vecs, docs):
+    """先写临时文件再 os.replace：中途失败不会留下半截文件，chunks 与 vectors 也不会错位。"""
     KB_DIR.mkdir(parents=True, exist_ok=True)
-    KB_CHUNKS.write_text(
-        json.dumps(chunks, ensure_ascii=False, indent=1), encoding="utf-8"
-    )
-    np.save(KB_VECS, vecs)
-    KB_DOCS.write_text(json.dumps(docs, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_c = KB_CHUNKS.with_name(KB_CHUNKS.name + ".tmp")
+    tmp_v = KB_VECS.with_name("vectors.tmp.npy")  # np.save 要求以 .npy 结尾
+    tmp_d = KB_DOCS.with_name(KB_DOCS.name + ".tmp")
+    tmp_c.write_text(json.dumps(chunks, ensure_ascii=False, indent=1), encoding="utf-8")
+    np.save(tmp_v, vecs)
+    tmp_d.write_text(json.dumps(docs, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_v, KB_VECS)
+    os.replace(tmp_c, KB_CHUNKS)
+    os.replace(tmp_d, KB_DOCS)
 
 
+_KB_LOCK = threading.RLock()
+
+
+def _kb_locked(fn):
+    """知识库的读-改-写必须串行，否则并发上传会互相覆盖。"""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with _KB_LOCK:
+            return fn(*a, **kw)
+
+    return wrapper
+
+
+@_kb_locked
 def add_document(filename: str, content: bytes, thread_id: str = "user-main") -> str:
     """解析一份上传的文档并入库（分块 → 向量化 → 追加存储），文档归属指定会话，仅该会话可见。"""
     text = _extract_text(filename, content)
@@ -719,6 +763,7 @@ def list_documents(thread_id: str = None) -> list:
     return [d for d in docs if d["thread_id"] == thread_id]
 
 
+@_kb_locked
 def delete_document(filename: str, thread_id: str = None) -> str:
     """删除一个文档及其全部知识片段（重建索引）；thread_id 为空按文件名全局删除。"""
     chunks_old, vecs_old, docs = _load_kb()
@@ -769,7 +814,7 @@ def search_documents(query: str, top_k: int = 5, thread_id: str = None) -> list:
 @tool
 def ask_document(query: str) -> str:
     """基于当前会话已上传的文档回答用户问题（RAG 检索 + 生成）。用户在问文档/资料/文件里写了什么时必须先调用本工具；本会话未上传文档时提示先上传。"""
-    hits = search_documents(query, thread_id=_ACTIVE_THREAD)
+    hits = search_documents(query, thread_id=_active_thread())
     if not hits:
         return "本会话还没有上传文档。请先在侧边栏「文档」区上传（支持 txt / md / docx / pdf）后再提问。"
     ctx = "\n\n".join(f"[片段{i+1}|《{h['doc']}》] {h['text']}" for i, h in enumerate(hits))
@@ -819,6 +864,7 @@ def _db():
     for col_sql in (
         "ALTER TABLE reminders ADD COLUMN action TEXT DEFAULT ''",
         "ALTER TABLE reminders ADD COLUMN action_arg TEXT DEFAULT ''",
+        "ALTER TABLE reminders ADD COLUMN last_fired TEXT DEFAULT ''",
     ):
         try:
             conn.execute(col_sql)
@@ -830,7 +876,13 @@ def _db():
 def _parse_at(at: str, repeat: str):
     """把模型给的时间格式解析成 (datetime, 星期几, HH:MM)。"""
     if repeat == "once":
-        return datetime.strptime(at.strip(), "%Y-%m-%d %H:%M"), None, None
+        # 同时支持 "YYYY-MM-DD HH:MM:SS"（秒级，用于“10秒后”）和 "YYYY-MM-DD HH:MM"
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.strptime(at.strip(), fmt), None, None
+            except ValueError:
+                continue
+        raise ValueError(f"时间格式应为 YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DD HH:MM，收到：{at}")
     if repeat == "daily":
         hm = at.strip()
         datetime.strptime(hm, "%H:%M")  # 校验格式
@@ -839,7 +891,7 @@ def _parse_at(at: str, repeat: str):
         parts = at.strip().split()
         if len(parts) != 2:
             raise ValueError("weekly 格式应为：周X HH:MM")
-        wd = parts[0].lower().lstrip("周星期礼拜week")
+        wd = re.sub(r"^(周|星期|礼拜|week)", "", parts[0].lower())  # 原 lstrip 会把 "wed" 剥成 "d"
         if wd in _WEEKDAY_MAP:
             wd = _WEEKDAY_MAP[wd]
         else:
@@ -852,7 +904,7 @@ def _parse_at(at: str, repeat: str):
 @tool
 def create_reminder(content: str, at: str, repeat: str = "once") -> str:
     """创建定时提醒/自动任务，到点后自动写入桌面备忘并推送到界面。
-    repeat=once 时 at 为具体时间 "YYYY-MM-DD HH:MM"（如 2026-10-13 08:00）；
+    repeat=once 时 at 为具体时间 "YYYY-MM-DD HH:MM:SS"（精确到秒，如 2026-10-13 08:00:30；用户说“X秒后/X分钟后”时必须先调 get_today 再换算到秒）；
     repeat=daily 时 at 为 "HH:MM"（每天这个时刻）；
     repeat=weekly 时 at 为 "周X HH:MM"（每周这一天这个时刻）。
     用户说"每天/每周/明早/后天 X 点提醒我 XX"时，先把相对时间换算成上述格式再调用。"""
@@ -1024,14 +1076,18 @@ def _check_due():
     now = datetime.now()
     conn = _db()
     rows = conn.execute(
-        "SELECT id, content, at, repeat, action, action_arg FROM reminders"
+        "SELECT id, content, at, repeat, action, action_arg, last_fired FROM reminders"
     ).fetchall()
-    for rid, content, at, repeat, action, action_arg in rows:
+    for rid, content, at, repeat, action, action_arg, last_fired in rows:
         if not _is_due(at, repeat, now):
             continue
         fired_at = now.strftime("%Y-%m-%d %H:%M")
+        # 去重：daily/weekly 按“分钟”匹配，轮询间隔内会命中多次，同一分钟只触发一次
+        if repeat != "once" and (last_fired or "") == fired_at:
+            continue
         alert_text = f"⏰ {content}"
         if action == "daily_report":
+            conn.commit()  # 先提交，避免联网生成日报期间一直占着数据库写锁
             # 动作型提醒：到点真正执行“聚合日报”任务链
             try:
                 report = generate_daily_report(city=action_arg or "")
@@ -1053,8 +1109,8 @@ def _check_due():
             conn.execute("DELETE FROM reminders WHERE id = ?", (rid,))
         else:
             conn.execute(
-                "UPDATE reminders SET at=? WHERE id=?",
-                (_advance_at(at, repeat), rid),
+                "UPDATE reminders SET last_fired=? WHERE id=?",
+                (fired_at, rid),
             )
     conn.commit()
     conn.close()
@@ -1064,7 +1120,7 @@ _scheduler_started = False
 
 
 def start_scheduler():
-    """启动后台调度线程（幂等）：每 30 秒检查一次到期提醒。"""
+    """启动后台调度线程（幂等）：每 5 秒检查一次到期提醒。"""
     global _scheduler_started
     if _scheduler_started:
         return
@@ -1076,7 +1132,7 @@ def start_scheduler():
                 _check_due()
             except Exception:
                 pass
-            _time.sleep(30)
+            _time.sleep(5)
 
     import threading
 
@@ -1097,7 +1153,6 @@ class _AlertHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1110,7 +1165,18 @@ class _AlertHandler(BaseHTTPRequestHandler):
             if u.path == "/alerts":
                 rows = get_unread_alerts()
                 self._send(200, rows)
-            elif u.path == "/ack":
+            else:
+                self._send(404, {"error": "not found"})
+        except Exception:
+            self._send(500, {"error": "internal"})
+
+    def do_POST(self):
+        """确认提醒必须用 POST：GET 不应改变状态，也避免被网页跨站请求误触发。"""
+        from urllib.parse import parse_qs, urlparse
+
+        try:
+            u = urlparse(self.path)
+            if u.path == "/ack":
                 qs = parse_qs(u.query)
                 aid = qs.get("id", [""])[0]
                 if aid:
@@ -1226,7 +1292,7 @@ def web_search(query: str, save_to_kb: bool = True) -> str:
         note = _compile_note(query, body)
         safe = re.sub(r'[\\/:*?"<>|]', "", query)[:12].strip() or "搜索"
         filename = f"搜索笔记-{safe}.md"
-        add_document(filename, note.encode("utf-8"), thread_id=_ACTIVE_THREAD)
+        add_document(filename, note.encode("utf-8"), thread_id=_active_thread())
         return f"「{query}」搜索结果：\n\n{body}\n\n📚 已整理成《{filename}》存入知识库，下次可直接问我"
     except Exception as e:
         return f"「{query}」搜索结果：\n\n{body}\n\n（笔记入库失败：{e}）"
@@ -1299,7 +1365,16 @@ def planner_node(state: State):
     prompt = f"对话历史：\n{context}\n\n当前任务：{user_task}"
     resp = deepseek_model().invoke([PLANNER_PROMPT, HumanMessage(content=prompt)])
     plan = resp.content
-    return {"plan": plan, "messages": [AIMessage(content=f"[规划] {plan}")]}
+    # 每个新委托从 planner 进入：重置上一轮残留的评审状态，否则 retry_count 会跨轮累加
+    # （返工机制只在会话第 1 条消息有效），上一轮的评审意见也会混进本轮 executor 的提示
+    return {
+        "plan": plan,
+        "review": "",
+        "retry_count": 0,
+        "execution_result": "",
+        "execution_trace": "",
+        "messages": [AIMessage(content=f"[规划] {plan}")],
+    }
 
 
 # ========== 节点2：执行（DeepSeek + 工具循环） ==========
@@ -1342,9 +1417,8 @@ def _run_tool_loop(model, messages, max_iters=6):
 
 
 def executor_node(state: State, config=None):
-    global _ACTIVE_THREAD
     if config and config.get("configurable", {}).get("thread_id"):
-        _ACTIVE_THREAD = config["configurable"]["thread_id"]
+        _ctx.thread_id = config["configurable"]["thread_id"]
     user_task = _last_user_task(state)  # 当前这条委托，而不是第一条历史
     review_note = (
         f"\n评审意见（若指出问题，必须按意见修正后重新执行）：\n{state['review']}"
@@ -1399,12 +1473,18 @@ def critic_node(state: State):
 
 
 # ========== 条件路由：评审"需修正"→ 回执行重做（最多 MAX_RETRY 轮） ==========
-MAX_RETRY = 2
+MAX_RETRY = 2  # 最多返工次数（critic 共最多执行 MAX_RETRY + 1 次）
+
+
+def _needs_fix(review: str) -> bool:
+    """评审结论是否为“需修正”：只看开头结论，避免“无需修正/不需修正”被子串误判。"""
+    head = (review or "").strip()[:12]
+    return "需修正" in head and "无需修正" not in head and "不需修正" not in head
 
 
 def _review_router(state: State) -> str:
     """评审说"需修正"且未超重做上限 → 回 executor 返工；否则结束。"""
-    if "需修正" in state.get("review", "") and state.get("retry_count", 0) < MAX_RETRY:
+    if _needs_fix(state.get("review", "")) and state.get("retry_count", 0) <= MAX_RETRY:
         return "executor"
     return "end"
 
@@ -1512,7 +1592,7 @@ def list_sessions() -> list:
     except Exception:
         pass
     # 置顶会话优先，组内按创建时间倒序
-    recs.sort(key=lambda r: (not r.get("pinned", False), r.get("created_at", "")), reverse=True)
+    recs.sort(key=lambda r: (bool(r.get("pinned", False)), r.get("created_at", "")), reverse=True)
     return recs
 
 
@@ -1520,6 +1600,12 @@ def delete_session(thread_id: str) -> None:
     """删除一个会话：sessions.json 记录 + SQLite 中该线程的全部检查点/写入。"""
     recs = _load_sessions()
     _save_sessions([r for r in recs if r["thread_id"] != thread_id])
+    # 该会话私有的文档/向量也一并清掉，不留孤儿数据
+    try:
+        for d in list_documents(thread_id):
+            delete_document(d["name"], thread_id)
+    except Exception:
+        pass
     try:
         conn = sqlite3.connect(DB_FILE)
         conn.execute("DELETE FROM checkpoints WHERE thread_id = ?", (thread_id,))
@@ -1595,6 +1681,36 @@ def load_conversation(graph, thread_id: str) -> list:
         if a:
             out.append({"role": "assistant", "content": a})
     return out
+
+
+def prune_checkpoints(keep: int = 3, vacuum: bool = True) -> int:
+    """每个会话只保留最近 keep 个 checkpoint，回收数据库体积。返回删除的 checkpoint 数。
+    本应用不用“时间回溯”，每个 checkpoint 又都存完整状态，不清理会越长越大。
+    请在 Streamlit 停止后手动运行：python -c "import main; print(main.prune_checkpoints())" """
+    conn = sqlite3.connect(DB_FILE)
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
+        conn.execute(
+            """DELETE FROM checkpoints WHERE rowid IN (
+                 SELECT rowid FROM (
+                   SELECT rowid, ROW_NUMBER() OVER (
+                     PARTITION BY thread_id, checkpoint_ns ORDER BY checkpoint_id DESC) AS rn
+                   FROM checkpoints) WHERE rn > ?)""",
+            (keep,),
+        )
+        conn.execute(
+            """DELETE FROM writes WHERE NOT EXISTS (
+                 SELECT 1 FROM checkpoints c WHERE c.thread_id = writes.thread_id
+                   AND c.checkpoint_ns = writes.checkpoint_ns
+                   AND c.checkpoint_id = writes.checkpoint_id)"""
+        )
+        conn.commit()
+        after = conn.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
+        if vacuum:
+            conn.execute("VACUUM")
+        return before - after
+    finally:
+        conn.close()
 
 
 # ========== 入口 ==========
