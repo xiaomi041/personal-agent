@@ -471,7 +471,9 @@ with st.sidebar:
             if "kb_processed" not in st.session_state:
                 st.session_state.kb_processed = {}
             up = st.file_uploader(
-                "上传文档（txt/md/docx/pdf）", type=["txt", "md", "docx", "pdf"], key="kb_up"
+                "上传文档（PDF / Word / Markdown / 图片，图片与扫描件自动 OCR）",
+                type=["txt", "md", "docx", "pdf", "png", "jpg", "jpeg", "bmp", "webp"],
+                key="kb_up",
             )
             if up is not None:
                 _fkey = f"{st.session_state.thread_id}|{up.name}|{up.size}"
@@ -492,7 +494,17 @@ with st.sidebar:
                 for i, d in enumerate(docs):
                     c1, c2 = st.columns([0.72, 0.28])
                     with c1:
-                        st.markdown(f"{d['name']} · {d['chunk_count']}片段")
+                        # 展示结构化解析结果：页数 / 表格数 / OCR 段数
+                        parts = [f"{d.get('chunk_count', 0)} 片段"]
+                        if d.get("page_count"):
+                            parts.append(f"{d['page_count']} 页")
+                        if d.get("table_count"):
+                            parts.append(f"{d['table_count']} 表格")
+                        if d.get("ocr_count"):
+                            parts.append(f"{d['ocr_count']} OCR")
+                        st.markdown(f"**{d['name']}** · " + " · ".join(parts))
+                        if d.get("created_at"):
+                            st.caption(f"入库时间 {d['created_at']}")
                     with c2:
                         if st.button("删除", key=f"kb_{i}", use_container_width=True):
                             st.success(
@@ -501,6 +513,21 @@ with st.sidebar:
                                 )
                             )
                             st.rerun()
+                    # 解析效果预览：确认页码/章节/表格有没有解析对
+                    with st.expander("🔎 解析预览", expanded=False):
+                        _pv = main.preview_document(
+                            d["name"], thread_id=st.session_state.thread_id
+                        )
+                        if not _pv:
+                            st.caption("_无片段_")
+                        for _c in _pv:
+                            _tag = f"[{_c['kind']}]"
+                            if _c.get("page"):
+                                _tag += f" 第 {_c['page']} 页"
+                            if _c.get("heading"):
+                                _tag += f" · {_c['heading'].split(' > ')[-1]}"
+                            st.caption(_tag)
+                            st.text(_c["text"][:200])
             else:
                 st.caption("_本会话暂无文档（各会话独立私有）_")
 
@@ -529,7 +556,7 @@ if not st.session_state.history:
         "- 🗓️ 生成今日日报：汇总天气、待办、备忘和知识库沉淀\n"
         "- ⏰ 设定提醒：一次性 / 每天 / 每周定时提醒\n"
         "- 📝 记录备忘、添加待办\n"
-        "- 📄 分析文档：上传 PDF / Word / 图片，帮你总结、问答、提炼要点\n"
+        "- 📄 分析文档：上传 PDF / Word / 图片（扫描件自动 OCR），支持顺带页码溯源、表格提取、全文摘要、字段抽取、两文档对比\n"
         "- 🗂️ 规划长期目标：备考、学习计划、项目推进等自动拆解\n"
         "- 🍽️ 生成菜单、查天气、联网搜索并沉淀笔记\n\n"
         "需要我做什么，直接说一声就行～"
@@ -542,6 +569,36 @@ for msg in st.session_state.history:
         _bubble(msg["content"])
     else:
         st.markdown(msg["content"])
+
+# ---------- 上一轮的执行过程（多智能体可观测性） ----------
+_last = st.session_state.get("last_trace")
+if _last and (_last.get("plan") or _last.get("trace")):
+    with st.expander("🔍 上一轮的执行过程（规划 / 工具调用 / 评审）", expanded=False):
+        if _last.get("plan"):
+            st.markdown("**① 规划**")
+            st.markdown(_last["plan"])
+        if _last.get("trace"):
+            st.markdown("**② 工具调用证据链**")
+            st.code(_last["trace"], language="text")
+        if _last.get("review"):
+            st.markdown("**③ 评审结论**")
+            st.markdown(_last["review"])
+        _hits = _last.get("hits") or []
+        if _hits:
+            st.markdown("**📎 引用片段（点开看原文）**")
+            for _i, _h in enumerate(_hits, 1):
+                _label = f"[{_i}] 《{_h['doc']}》"
+                if _h.get("page"):
+                    _label += f" · 第 {_h['page']} 页"
+                if _h.get("heading"):
+                    _label += " · " + _h["heading"].split(" > ")[-1]
+                _label += f" · 相关度 {_h.get('score', 0):.2f}"
+                with st.expander(_label, expanded=False):
+                    # 高亮命中的关键词，方便快速定位答案位置
+                    st.markdown(
+                        main.highlight_terms(_h["text"], _last.get("task", "")),
+                        unsafe_allow_html=True,
+                    )
 
 # ---------- 委托输入 ----------
 task = st.chat_input("委托一个任务，例如：记个待办：周五下午开组会")
@@ -556,6 +613,7 @@ if task:
     plan_text = ""
     trace_text = ""
     review_text = ""
+    main._LAST_HITS[:] = []  # 清空上一轮的命中片段
     try:
         for chunk in graph.stream(
             {"messages": [HumanMessage(content=task)]},
@@ -563,8 +621,12 @@ if task:
             stream_mode="updates",
         ):
             for node, data in chunk.items():
-                if node == "planner" and data.get("plan"):
-                    plan_text = data["plan"]
+                if node == "planner":
+                    if data.get("plan"):
+                        plan_text = data["plan"]
+                    # 信息不全时规划节点会直接给出追问，需要当作本轮答复
+                    if data.get("execution_result"):
+                        execution_text = data["execution_result"]
 
                 elif node == "executor":
                     trace_text = data.get("execution_trace", "")
@@ -579,6 +641,14 @@ if task:
     st.session_state.history.append(
         {"role": "assistant", "content": execution_text or "（无执行结果）"}
     )
+    # 保留本轮的多智能体过程（计划/证据链/评审），供界面展开查看
+    st.session_state["last_trace"] = {
+        "task": task,
+        "plan": plan_text,
+        "trace": trace_text,
+        "review": review_text,
+        "hits": list(main._LAST_HITS),
+    }
     main.register_session(st.session_state.thread_id, task)
     main.update_session_tags(
         st.session_state.thread_id, [task, execution_text or ""]

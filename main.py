@@ -34,9 +34,12 @@ DEEPSEEK_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 QWEN_KEY = os.getenv("QWEN_API_KEY", "")
 
 BASE_DIR = Path(__file__).parent
-DB_FILE = BASE_DIR / "agent_memory.db"
-# 备忘写到桌面，打开桌面就能看到
-MEMO_FILE = Path(os.path.expanduser("~/Desktop")) / "memos.md"
+# 运行期数据目录：数据库/会话/计划/知识库/备忘都放这里。
+# 本地默认就是项目根目录；容器部署时用 DATA_DIR 环境变量指向挂载卷，实现持久化。
+DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_FILE = DATA_DIR / "agent_memory.db"
+MEMO_FILE = DATA_DIR / "memos.md"
 
 if not DEEPSEEK_KEY or not QWEN_KEY:
     raise SystemExit("请在 .env 中配置 DEEPSEEK_API_KEY 和 QWEN_API_KEY")
@@ -174,34 +177,65 @@ def _auto_pptx_pages(content: str) -> list:
     return [cover] + pages  # 第一页封面 + 后续内容页
 
 
+def _output_dir() -> Path:
+    """产出目录：本地优先桌面（打开就能看到），容器内用 DATA_DIR/outputs（挂载卷，重启不丢）。
+
+    判断依据是「桌面是否本来就存在」——不能主动创建 ~/Desktop，
+    否则容器里会凭空建一个 /root/Desktop，文件落在镜像层，容器一重建就没了。
+    """
+    desktop = Path(os.path.expanduser("~/Desktop"))
+    candidates: list[Path] = []
+    if desktop.is_dir():
+        candidates.append(desktop)
+    candidates.append(DATA_DIR / "outputs")
+
+    for base in candidates:
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            probe = base / ".write_probe"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return base
+        except Exception:
+            continue
+    return DATA_DIR / "outputs"
+
+
 def _save_with_fallback(out: Path, saver) -> Path:
-    """保存文件；若目标被占用（如正在 WPS 中打开）则自动用 名称(1).后缀 重试。"""
+    """保存文件；目标被占用（如在 WPS 中打开）时用 名称(1).后缀 重试。
+
+    全部失败时必须抛错 —— 绝不能返回一个并不存在的路径，
+    否则上层会显示「已生成文件」而磁盘上什么都没有。
+    """
+    out.parent.mkdir(parents=True, exist_ok=True)
     try:
         saver(out)
         return out
-    except PermissionError:
+    except PermissionError as first:
         stem, ext = out.stem, out.suffix
-        for i in range(1, 100):
+        for i in range(1, 10):
             cand = out.with_name(f"{stem}({i}){ext}")
             try:
                 saver(cand)
                 return cand
             except PermissionError:
                 continue
-        return out
+        raise PermissionError(f"无法写入 {out}（文件被占用或无写权限）") from first
 
 
 @tool
 def write_file(filename: str, content: str) -> str:
-    """把内容生成文件保存到桌面，按扩展名自动识别格式。
+    """把内容生成文件保存，按扩展名自动识别格式。
     - .txt / .md：直接写文本
     - .docx：Word 文档，换行分段
     - .pptx：PPT。可用“---”分页，每页第一行是标题、其余行是该页要点；不写“---”也可以，代码会按小标题自动分页
-    filename 必须带扩展名，如“周报.md”“计划.pptx”。"""
+    filename 必须带扩展名，如“周报.md”“计划.pptx”。
+    本地保存到桌面；容器部署时（没有桌面目录）保存到 DATA_DIR/outputs。
+    """
     from docx import Document
     from pptx import Presentation
 
-    out = Path(os.path.expanduser("~/Desktop")) / filename
+    out = _output_dir() / Path(filename).name
     ext = out.suffix.lower()
 
     if ext in (".txt", ".md", ".csv", ".json", ".log"):
@@ -311,7 +345,7 @@ def write_file(filename: str, content: str) -> str:
 
 
 # ---------- 待办管理 ----------
-TODO_FILE = BASE_DIR / "todos.json"
+TODO_FILE = DATA_DIR / "todos.json"
 
 
 def _load_todos() -> list:
@@ -386,7 +420,7 @@ def clear_todos() -> str:
 
 
 # ---------- 任务计划（拆解 + 进度跟踪） ----------
-PLANS_FILE = BASE_DIR / "plans.json"
+PLANS_FILE = DATA_DIR / "plans.json"
 
 
 def _load_plans() -> list:
@@ -582,7 +616,7 @@ import re
 import requests
 import numpy as np
 
-KB_DIR = BASE_DIR / "kb"
+KB_DIR = DATA_DIR / "kb"
 KB_CHUNKS = KB_DIR / "chunks.json"   # [{thread_id, doc, text}]
 KB_VECS = KB_DIR / "vectors.npy"     # numpy 矩阵（行 = 片段）
 KB_DOCS = KB_DIR / "docs.json"       # [{thread_id, name, chunk_count, created_at}]
@@ -610,51 +644,6 @@ def _embed_texts(texts: list) -> list:
         data.sort(key=lambda d: d["index"])
         out.extend(d["embedding"] for d in data)
     return out
-
-
-def _extract_text(name: str, content: bytes) -> str:
-    """按扩展名解析文件内容为纯文本。"""
-    suffix = Path(name).suffix.lower()
-    if suffix in (".txt", ".md"):
-        return content.decode("utf-8", errors="ignore")
-    if suffix == ".docx":
-        from io import BytesIO
-
-        from docx import Document
-
-        doc = Document(BytesIO(content))
-        return "\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    if suffix == ".pdf":
-        from io import BytesIO
-
-        from pypdf import PdfReader
-
-        reader = PdfReader(BytesIO(content))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    raise ValueError(f"不支持的文件类型：{suffix}（支持 txt / md / docx / pdf）")
-
-
-def _chunk_text(text: str, size: int = 350, overlap: int = 40) -> list:
-    """按段落切块：每个段落作为完整语义单元；超长段落再按 size 字 + overlap 重叠续切。"""
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    if not text:
-        return []
-    chunks = []
-    for para in re.split(r"\n\s*\n", text):
-        para = para.strip()
-        if not para:
-            continue
-        if len(para) <= size:
-            chunks.append(para)
-            continue
-        start = 0
-        while start < len(para):
-            end = min(start + size, len(para))
-            chunks.append(para[start:end].strip())
-            if end >= len(para):
-                break
-            start = max(end - overlap, start + 1)
-    return [c for c in chunks if c]
 
 
 def _load_kb():
@@ -686,29 +675,69 @@ def _save_kb(chunks, vecs, docs):
 
 
 def add_document(filename: str, content: bytes, thread_id: str = "user-main") -> str:
-    """解析一份上传的文档并入库（分块 → 向量化 → 追加存储），文档归属指定会话，仅该会话可见。"""
-    text = _extract_text(filename, content)
-    if len(text.strip()) < 20:
-        raise ValueError("文档内容为空或无法提取文字")
-    chunks = _chunk_text(text)
-    vecs_new = np.array(_embed_texts(chunks), dtype="float32")
+    """解析一份上传的文档并入库（结构化解析 → 切片 → 向量化 → 追加存储），文档归属指定会话，仅该会话可见。
+
+    - 支持 PDF / Word / Markdown / txt / 图片（图片与扫描页走 OCR）
+    - 每个切片携带 page / heading / kind，供答案溯源到「第几页 · 哪一节」
+    - 同名文档按内容哈希判重：内容未变直接跳过，避免重复消耗 embedding
+    """
+    import documents as docengine
+
+    digest = docengine.sha256(content)
     chunks_old, vecs_old, docs = _load_kb()
-    chunks_old.extend(
-        {"thread_id": thread_id, "doc": filename, "idx": i, "text": c}
-        for i, c in enumerate(chunks)
-    )
+
+    same = [d for d in docs if d["thread_id"] == thread_id and d["name"] == filename]
+    if same and same[0].get("sha256") == digest:
+        return f"《{filename}》内容未变更，跳过重复解析（已有 {same[0].get('chunk_count', 0)} 个片段）"
+
+    blocks = docengine.extract_blocks(filename, content)
+    new_chunks = docengine.chunk_blocks(blocks)
+    if not new_chunks:
+        raise ValueError("文档内容为空或无法提取文字")
+
+    vecs_new = np.array(_embed_texts([c.text for c in new_chunks]), dtype="float32")
+
+    # 同名文档覆盖：先摘掉旧片段，再追加新片段（避免同一份文件多版本共存）
+    keep = [i for i, c in enumerate(chunks_old) if not (c["thread_id"] == thread_id and c["doc"] == filename)]
+    chunks_old = [chunks_old[i] for i in keep]
+    if len(vecs_old):
+        vecs_old = vecs_old[keep]
+
+    for i, c in enumerate(new_chunks):
+        chunks_old.append({
+            "thread_id": thread_id,
+            "doc": filename,
+            "idx": i,
+            "text": c.text,
+            "page": c.page,
+            "heading": c.heading,
+            "kind": c.kind,
+        })
+
     vecs = np.vstack([vecs_old, vecs_new]) if len(vecs_old) else vecs_new
     docs = [d for d in docs if not (d["thread_id"] == thread_id and d["name"] == filename)]
-    docs.append(
-        {
-            "thread_id": thread_id,
-            "name": filename,
-            "chunk_count": len(chunks),
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-    )
+    pages = sorted({c.page for c in new_chunks if c.page})
+    docs.append({
+        "thread_id": thread_id,
+        "name": filename,
+        "chunk_count": len(new_chunks),
+        "page_count": len(pages),
+        "table_count": sum(1 for c in new_chunks if c.kind == "table"),
+        "ocr_count": sum(1 for c in new_chunks if c.kind == "image"),
+        "sha256": digest,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
     _save_kb(chunks_old, vecs, docs)
-    return f"已读入《{filename}》：{len(chunks)} 个知识片段，可以直接问我"
+
+    extra = []
+    if pages:
+        extra.append(f"{len(pages)} 页")
+    if docs[-1]["table_count"]:
+        extra.append(f"{docs[-1]['table_count']} 个表格")
+    if docs[-1]["ocr_count"]:
+        extra.append(f"{docs[-1]['ocr_count']} 段 OCR")
+    suffix = ("，含 " + "、".join(extra)) if extra else ""
+    return f"已读入《{filename}》：{len(new_chunks)} 个知识片段{suffix}，可以直接问我"
 
 
 def list_documents(thread_id: str = None) -> list:
@@ -739,8 +768,119 @@ def delete_document(filename: str, thread_id: str = None) -> str:
     return f"已删除《{filename}》"
 
 
-def search_documents(query: str, top_k: int = 5, thread_id: str = None) -> list:
-    """语义检索：query 向量与库内所有片段做余弦相似度；thread_id 指定时只检索该会话文档。"""
+def _bm25_scores(query: str, texts: list[str], k1: float = 1.5, b: float = 0.75) -> np.ndarray:
+    """字符二元组 BM25：解决「合同编号」「A-2024-001」这类精确词被向量稀释的问题。
+
+    中文没有天然分词，用二元字组（bigram）当 term 足够稳，且不引入分词依赖。
+    """
+    def grams(s: str) -> list[str]:
+        s = re.sub(r"\s+", "", s)
+        if len(s) < 2:
+            return [s] if s else []
+        return [s[i:i + 2] for i in range(len(s) - 1)]
+
+    q_grams = grams(query)
+    if not q_grams or not texts:
+        return np.zeros(len(texts), dtype="float32")
+
+    doc_grams = [grams(t) for t in texts]
+    n = len(doc_grams)
+    avg_len = sum(len(g) for g in doc_grams) / max(n, 1) or 1.0
+
+    df: dict[str, int] = {}
+    for g in doc_grams:
+        for term in set(g):
+            df[term] = df.get(term, 0) + 1
+
+    import math
+    idf = {t: math.log(1 + (n - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5)) for t in set(q_grams)}
+
+    scores = np.zeros(n, dtype="float32")
+    for i, g in enumerate(doc_grams):
+        tf: dict[str, int] = {}
+        for term in g:
+            tf[term] = tf.get(term, 0) + 1
+        dl = len(g)
+        s = 0.0
+        for term in q_grams:
+            if term not in tf:
+                continue
+            f = tf[term]
+            s += idf.get(term, 0.0) * (f * (k1 + 1)) / (f + k1 * (1 - b + b * dl / avg_len))
+        scores[i] = s
+
+    # 归一到 0~1，便于与余弦分加权
+    mx = float(scores.max()) if scores.size else 0.0
+    if mx > 0:
+        scores = scores / mx
+    return scores
+
+
+def preview_document(name: str, thread_id: str = None, n: int = 4) -> list[dict]:
+    """取某份文档的前 n 个切片，供界面预览解析效果（页码/章节/类型 + 正文）。"""
+    chunks, _, _ = _load_kb()
+    picked = [
+        c for c in chunks
+        if c["doc"] == name and (thread_id is None or c["thread_id"] == thread_id)
+    ]
+    return [
+        {"page": c.get("page"), "heading": c.get("heading", ""),
+         "kind": c.get("kind", "text"), "text": c.get("text", "")}
+        for c in picked[:n]
+    ]
+
+
+def highlight_terms(text: str, query: str, max_marks: int = 8) -> str:
+    """把 query 中与 text 重合的片段高亮（返回可交给 st.markdown 的 HTML）。
+
+    中文没有空格分隔，「违约金是多少」不可能整串出现在正文里，
+    因此按二元组扫描、合并连续命中，得到「违约金」这样的完整词。
+    """
+    import html as _html
+
+    t = text or ""
+    q = re.sub(r"\s+", "", query or "")
+    if len(q) < 2 or not t:
+        return _html.escape(t)
+
+    qgrams = {q[i:i + 2] for i in range(len(q) - 1)}
+    spans: list[tuple[int, int]] = []
+    i, n = 0, len(t)
+    while i < n - 1:
+        if t[i:i + 2] in qgrams:
+            j = i + 2
+            while j < n - 1 and t[j:j + 2] in qgrams:
+                j += 1
+            spans.append((i, j))
+            i = j
+        else:
+            i += 1
+
+    if not spans:
+        return _html.escape(t)
+
+    out, last = [], 0
+    for a, b in spans[:max_marks]:
+        out.append(_html.escape(t[last:a]))
+        out.append(f"<mark>{_html.escape(t[a:b])}</mark>")
+        last = b
+    out.append(_html.escape(t[last:]))
+    return "".join(out)
+
+
+def search_documents(query: str, top_k: int = 5, thread_id: str = None,
+                     min_score: float | None = None) -> list:
+    """混合检索：向量余弦 + 字符 BM25 加权融合，按会话过滤，低于阈值不返回。
+
+    纯向量检索对「违约金」「A-2024-001」这类精确词不敏感，
+    因此用 BM25 补一路分数：final = 0.7 * cosine + 0.3 * bm25。
+    阈值默认读环境变量 DOC_MIN_SCORE，未设置则 0.42，问不到就不硬答。
+    """
+    if min_score is None:
+        try:
+            min_score = float(os.getenv("DOC_MIN_SCORE", "0.42"))
+        except ValueError:
+            min_score = 0.42
     chunks, vecs, _ = _load_kb()
     if thread_id is not None:
         keep = [i for i, c in enumerate(chunks) if c["thread_id"] == thread_id]
@@ -753,34 +893,195 @@ def search_documents(query: str, top_k: int = 5, thread_id: str = None) -> list:
     qv = np.array(_embed_texts([query])[0], dtype="float32")
     qn = np.linalg.norm(qv) + 1e-9
     norms = np.linalg.norm(vecs, axis=1, keepdims=True).ravel() + 1e-9
-    scores = (vecs @ qv) / (norms * qn)
-    idx = np.argsort(-scores)[:top_k]
+    cosine = (vecs @ qv) / (norms * qn)
+
+    # 混合检索：向量语义 + BM25 精确词，两路加权融合
+    bm25 = _bm25_scores(query, [c["text"] for c in chunks])
+    adjusted = 0.7 * cosine + 0.3 * bm25
+
+    idx = np.argsort(-adjusted)[:top_k]
     return [
         {
             "doc": chunks[i]["doc"],
             "idx": chunks[i].get("idx", 0),
             "text": chunks[i]["text"],
-            "score": float(scores[i]),
+            "page": chunks[i].get("page"),
+            "heading": chunks[i].get("heading", ""),
+            "kind": chunks[i].get("kind", "text"),
+            "score": float(adjusted[i]),
+            "cosine": float(cosine[i]),
+            "bm25": float(bm25[i]),
         }
         for i in idx
+        if float(adjusted[i]) >= min_score
     ]
+
+
+_GLOBAL_Q = re.compile(r"(总结|概括|归纳|全文|整体|大纲|结构|主要(讲|说|内容)|讲了(什么|啥)|全文要点)")
+
+# 最近一次检索命中的片段，供界面展示「引用原文」（不参与业务逻辑）
+_LAST_HITS: list[dict] = []
+
+
+def _thread_chunks(thread_id: str) -> list[dict]:
+    """取出当前会话的全部片段（按页/顺序），供全局摘要使用。"""
+    chunks, _, _ = _load_kb()
+    return [c for c in chunks if c["thread_id"] == thread_id]
+
+
+def summarize_document(query: str, thread_id: str, max_chunks: int = 60) -> str:
+    """全局摘要（map-reduce）：先分块摘要，再归并成总述。
+
+    top-k 检索只能覆盖文档的一小部分，问「总结全文」时必然漏内容，
+    因此这类问题走「逐批摘要 → 汇总」的两段式流程。
+    """
+    import documents as docengine
+
+    chunks = _thread_chunks(thread_id)
+    if not chunks:
+        return "本会话还没有上传文档，请先在侧边栏「文档」区上传后再让我总结。"
+    chunks = chunks[:max_chunks]
+
+    def label(c: dict) -> str:
+        return docengine.citation(c)
+
+    # map：每批 8 个片段做一次局部摘要
+    batch_size = 8
+    partials: list[str] = []
+    for start in range(0, len(chunks), batch_size):
+        batch = chunks[start:start + batch_size]
+        body = "\n\n".join(f"[{label(c)}] {c['text']}" for c in batch)
+        prompt = (
+            "下面是某份文档的一部分内容。请提炼这段内容的关键信息（要点式，不超过 5 条），"
+            "只依据给定内容，不要补充外部知识。\n\n" + body
+        )
+        resp = deepseek_model().invoke([HumanMessage(content=prompt)])
+        partials.append(f"第 {start // batch_size + 1} 部分：\n{resp.content}")
+
+    # reduce：汇总各部分，回答用户的全局问题
+    merged = "\n\n".join(partials)
+    prompt = (
+        f"用户问题：{query}\n\n以下是文档各部分的摘要：\n{merged}\n\n"
+        "请综合上述内容回答用户问题，给出结构化总述（可用小标题或分点）。"
+        "结尾用一行注明依据的文档名。只依据给定内容，不要编造。"
+    )
+    resp = deepseek_model().invoke([HumanMessage(content=prompt)])
+    docs = sorted({c["doc"] for c in chunks})
+    return f"{resp.content}\n\n（依据：{'、'.join(f'《{d}》' for d in docs)}，共 {len(chunks)} 个片段）"
+
+
+@tool
+def extract_fields(fields: str) -> str:
+    """从当前会话的文档中抽取指定字段并整理成表格。
+
+    fields 用逗号分隔要抽取的字段，例如："甲方, 乙方, 合同金额, 签署日期, 违约金比例"。
+    用户要求「提取/汇总/整理出关键信息」时要调用本工具，而不是直接看片段自己拼。
+    """
+    import documents as docengine
+
+    thread = _ACTIVE_THREAD or "user-main"
+    chunks = _thread_chunks(thread)
+    if not chunks:
+        return "本会话还没有上传文档。请先在侧边栏「文档」区上传（支持 PDF / Word / Markdown / 图片）后再抽取。"
+
+    field_list = [f.strip() for f in re.split(r"[,，、;；]", fields) if f.strip()]
+    if not field_list:
+        return "请给出要抽取的字段，用逗号分隔，例如：甲方, 乙方, 金额"
+
+    # 每个字段单独检索，保证长文档里不同位置的字段都能被覆盖到
+    picked: dict[tuple, dict] = {}
+    for f in field_list:
+        for h in search_documents(f, top_k=2, thread_id=thread, min_score=0.30):
+            picked[(h["doc"], h["idx"])] = h
+
+    ctx = "\n\n".join(
+        f"[{docengine.citation(h)}]\n{h['text']}"
+        for h in list(picked.values())[:12]
+    )
+    prompt = (
+        "你是信息抽取助手。请从下面的文档片段中抽取指定字段。\n"
+        f"需要抽取的字段：{'、'.join(field_list)}\n\n"
+        "要求：\n"
+        "1. 只使用片段中出现的信息，找不到的字段填「未提及」，严禁编造；\n"
+        "2. 输出 Markdown 表格，列为：字段 | 内容 | 出处；\n"
+        "3. 出处写成「文档名 第 N 页」或「文档名 章节名」，取自片段方括号里的标注。\n\n"
+        f"文档片段：\n{ctx}"
+    )
+    resp = deepseek_model().invoke([HumanMessage(content=prompt)])
+    return resp.content
+
+
+@tool
+def compare_documents(doc_a: str, doc_b: str, aspect: str = "关键差异") -> str:
+    """对比当前会话中的两份文档，输出差异表格。
+
+    doc_a / doc_b 是文档名的关键字（不必写全名），aspect 是要对比的方面，例如"付款条款""责任划分"。
+    """
+    import documents as docengine
+
+    thread = _ACTIVE_THREAD or "user-main"
+    chunks = _thread_chunks(thread)
+    if not chunks:
+        return "本会话还没有上传文档，无法对比。"
+
+    def pick(name: str, k: int = 6) -> list[dict]:
+        return [c for c in chunks if name.lower() in c["doc"].lower()][:k]
+
+    a_chunks, b_chunks = pick(doc_a), pick(doc_b)
+    if not a_chunks:
+        docs = sorted({c["doc"] for c in chunks})
+        return f"找不到《{doc_a}》，当前会话文档：{'、'.join(docs)}"
+    if not b_chunks:
+        docs = sorted({c["doc"] for c in chunks})
+        return f"找不到《{doc_b}》，当前会话文档：{'、'.join(docs)}"
+
+    def block(cs: list[dict]) -> str:
+        return "\n\n".join(f"[{docengine.citation(c)}]\n{c['text']}" for c in cs)
+
+    prompt = (
+        f"你是文档对比助手。请就「{aspect}」对比下面两份文档。\n\n"
+        f"=== 文档 A（{a_chunks[0]['doc']}）===\n{block(a_chunks)}\n\n"
+        f"=== 文档 B（{b_chunks[0]['doc']}）===\n{block(b_chunks)}\n\n"
+        "要求：输出 Markdown 表格（列：对比项 | 文档 A | 文档 B），"
+        "只依据给定内容，缺失的信息写「未提及」，最后用一句话总结主要差异。"
+    )
+    resp = deepseek_model().invoke([HumanMessage(content=prompt)])
+    return resp.content
 
 
 @tool
 def ask_document(query: str) -> str:
-    """基于当前会话已上传的文档回答用户问题（RAG 检索 + 生成）。用户在问文档/资料/文件里写了什么时必须先调用本工具；本会话未上传文档时提示先上传。"""
-    hits = search_documents(query, thread_id=_ACTIVE_THREAD)
+    """基于当前会话已上传的文档回答用户问题（RAG 检索 + 生成）。
+
+    用户在问文档/资料/文件里写了什么时必须先调用本工具；
+    问「总结/概括/全文要点」这类全局问题时，工具内部会自动改用 map-reduce 摘要。
+    """
+    import documents as docengine
+
+    thread = _ACTIVE_THREAD or "user-main"
+
+    # 全局问题 → 两段式摘要，避免 top-k 覆盖不足
+    if _GLOBAL_Q.search(query):
+        return summarize_document(query, thread)
+
+    hits = search_documents(query, thread_id=thread)
     if not hits:
-        return "本会话还没有上传文档。请先在侧边栏「文档」区上传（支持 txt / md / docx / pdf）后再提问。"
-    ctx = "\n\n".join(f"[片段{i+1}|《{h['doc']}》] {h['text']}" for i, h in enumerate(hits))
+        if not _thread_chunks(thread):
+            return "本会话还没有上传文档。请先在侧边栏「文档」区上传（支持 PDF / Word / Markdown / 图片）后再提问。"
+        return "知识库中没有检索到与这个问题相关的内容（相似度低于阈值）。可以换个说法，或确认相关文档是否已上传。"
+
+    ctx = "\n\n".join(
+        f"[{i+1}] {docengine.citation(h)}\n{h['text']}" for i, h in enumerate(hits)
+    )
+    _LAST_HITS[:] = hits
     prompt = (
-        "你是文档问答助手。严格依据下面提供的文档片段回答用户问题；"
+        "你是文档分析助手。严格依据下面提供的文档片段回答用户问题；"
         "如果片段中没有相关信息，直接说明'知识库中没有相关内容'，不要编造。"
         "回答末尾用 [1][2] 标注引用的片段编号。\n\n"
         f"文档片段：\n{ctx}\n\n用户问题：{query}\n\n回答："
     )
     resp = deepseek_model().invoke([HumanMessage(content=prompt)])
-    src = "、".join(dict.fromkeys(f"《{h['doc']}》片段#{h.get('idx', 0)}" for h in hits))
+    src = "、".join(dict.fromkeys(docengine.citation(h) for h in hits))
     return f"{resp.content}\n\n（依据：{src}）"
 
 
@@ -1234,7 +1535,8 @@ def web_search(query: str, save_to_kb: bool = True) -> str:
 
 TOOLS = [
     get_today, write_memo, write_file, add_todo, list_todos, complete_todo,
-    get_weather, ask_document, create_reminder, list_reminders,
+    get_weather, ask_document, extract_fields, compare_documents,
+    create_reminder, list_reminders,
     cancel_reminder, web_search, generate_daily_report, schedule_daily_report,
     create_plan, list_plans, update_subtask, delete_plan,
 ]
@@ -1290,6 +1592,10 @@ def _build_context(state) -> str:
 PLANNER_PROMPT = SystemMessage(
     "你是任务规划师。把用户委托的任务拆成 1-3 步可执行计划，"
     "只输出计划本身，格式：'计划：①... ②... ③...'，不要执行任务，不要解释。"
+    "只有在任务缺少「无法从工具或上下文获得」的关键参数时才追问，"
+    "输出一行：'需要补充：<一句话具体问题>'。"
+    "以下情况一律不要追问，直接给计划：时间和日期（有 get_today 工具）、天气（可查默认城市）、"
+    "待办/计划/文档列表（有对应工具）、用户已经在上面说过的信息。"
 )
 
 
@@ -1298,8 +1604,25 @@ def planner_node(state: State):
     context = _build_context(state)
     prompt = f"对话历史：\n{context}\n\n当前任务：{user_task}"
     resp = deepseek_model().invoke([PLANNER_PROMPT, HumanMessage(content=prompt)])
-    plan = resp.content
+    plan = (resp.content or "").strip()
+
+    # 关键信息缺失 → 直接向用户澄清，不进入执行（避免瞎猜参数）
+    if plan.startswith("需要补充") or "需要补充：" in plan[:12]:
+        question = plan.split("：", 1)[-1].strip() if "：" in plan else plan
+        return {
+            "plan": plan,
+            "execution_result": f"🤔 {question}",
+            "messages": [AIMessage(content=f"🤔 {question}")],
+        }
     return {"plan": plan, "messages": [AIMessage(content=f"[规划] {plan}")]}
+
+
+def _plan_router(state: State) -> str:
+    """规划阶段判断信息是否齐全：需要补充 → 直接结束并反问用户。"""
+    plan = state.get("plan", "") or ""
+    if plan.startswith("需要补充") or "需要补充：" in plan[:12]:
+        return "end"
+    return "executor"
 
 
 # ========== 节点2：执行（DeepSeek + 工具循环） ==========
@@ -1308,6 +1631,10 @@ EXECUTOR_PROMPT = SystemMessage(
     "1. 需要日期时先调 get_today；"
     "2. 需要记录备忘时调 write_memo；"
     "3. 用户询问已上传文档/知识库里的内容时，必须调 ask_document；"
+    "3.1 用户要求从文档里提取/整理字段（如甲方、金额、期限）时，调 extract_fields；"
+    "3.2 用户要求对比两份文档时，调 compare_documents；"
+    "3.3 用户问「总结全文 / 概括要点」这类全局问题时，仍调 ask_document（内部会自动走分段摘要）；"
+    "3.4 分析完成后用户要求导出/保存成文件时，把结论整理成 Markdown 再调 write_file（.docx / .pptx 会自动转换）；"
     "4. 用户要求生成今日/每日聚合日报、汇总报告时，调 generate_daily_report；"
     "5. 用户要求每天早上定时生成日报（“每天早上 X 点”）时，调 schedule_daily_report；"
     "6. 用户委托长期目标（准备考试/学习计划/项目推进/养成习惯等）要求拆解规划时，调 create_plan 自动拆解并保存；"
@@ -1416,7 +1743,8 @@ def build_graph(checkpointer):
     g.add_node("executor", executor_node)
     g.add_node("critic", critic_node)
     g.add_edge(START, "planner")
-    g.add_edge("planner", "executor")
+    # 规划后分流：信息不全 → 直接反问用户；齐全 → 进入执行
+    g.add_conditional_edges("planner", _plan_router, {"executor": "executor", "end": END})
     g.add_edge("executor", "critic")
     # 评审"需修正"→ 回 executor 重做（自主决策循环）；通过 → 结束
     g.add_conditional_edges("critic", _review_router, {"executor": "executor", "end": END})
@@ -1430,7 +1758,7 @@ def get_graph():
 
 
 # ========== 会话管理（回访历史会话） ==========
-SESSIONS_FILE = BASE_DIR / "sessions.json"
+SESSIONS_FILE = DATA_DIR / "sessions.json"
 
 
 def _load_sessions() -> list:

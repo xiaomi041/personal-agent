@@ -31,3 +31,7 @@ _ver.txt
 
 # RAG 知识库
 kb/
+
+# 生成的产出文件（Word / PPT / 导出报告）
+outputs/
+todos.json
