@@ -14,7 +14,7 @@ THREAD = "analysis-thread"
 
 
 def run() -> int:
-    main._ACTIVE_THREAD = THREAD
+    main.bind_thread(THREAD)
     for name in ("合作协议.pdf", "产品手册.docx"):
         try:
             main.delete_document(name, thread_id=THREAD)

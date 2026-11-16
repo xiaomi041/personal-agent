@@ -38,7 +38,7 @@ def ask(task: str) -> tuple[str, str]:
 
 def run() -> int:
     ok = True
-    main._ACTIVE_THREAD = THREAD
+    main.bind_thread(THREAD)
 
     print("=== 1) 缺参数的委托应触发反问 ===")
     ans, plan = ask("帮我设个提醒")

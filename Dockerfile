@@ -23,8 +23,9 @@ RUN apt-get update \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 只复制运行所需源码，.env / 数据库 / 虚拟环境都不会进镜像（见 .dockerignore）
-COPY main.py a.py documents.py ./
+# 拷贝源码：整体拷入而不是写死文件名。写死列表的话，新增模块忘改这里，
+# 就会出现"本地能跑、镜像里 ModuleNotFoundError"的事故（密钥/数据/虚拟环境已由 .dockerignore 排除）。
+COPY . .
 
 RUN mkdir -p /app/data
 

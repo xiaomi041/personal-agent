@@ -158,8 +158,8 @@ def _kw_match(kw, text: str) -> bool:
 
 
 def prep() -> None:
-    # ask_document 内部用 _ACTIVE_THREAD 定位会话，这里手动指向评测会话
-    main._ACTIVE_THREAD = THREAD
+    # ask_document 内部靠 ContextVar 定位会话，这里显式绑定到评测会话
+    main.bind_thread(THREAD)
     # 清理可能的残留
     for name in ("合作协议.pdf", "产品手册.docx", "合同扫描件.png", "长文档.pdf"):
         try:
