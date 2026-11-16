@@ -39,11 +39,19 @@ def main_():
     check("空串不产生空哨兵对", main._wrap_untrusted("   ") == "")
 
     print("[2] 各条外部内容路径是否接线")
-    src = open(os.path.join(APP_DIR, "main.py"), encoding="utf-8").read()
+    # 直接看函数对象的源码：函数搬到哪个模块都能查到（main.py 已拆成多个模块）
+    import inspect
     for fn in ("ask_document", "summarize_document", "extract_fields", "compare_documents", "web_search"):
-        start = src.find(f"def {fn}(")
-        check(f"{fn} 使用了包裹器", start != -1 and "_wrap_untrusted" in src[start:start + 2600],
-              "未找到 _wrap_untrusted 调用")
+        tool_obj = getattr(main, fn, None)
+        func = getattr(tool_obj, "func", tool_obj)  # @tool 包了一层，取回原函数
+        src = ""
+        if func is not None:
+            try:
+                src = inspect.getsource(func)
+            except (OSError, TypeError):
+                src = ""
+        check(f"{fn} 使用了包裹器", "_wrap_untrusted" in src,
+              f"未找到 _wrap_untrusted 调用（函数定义在 {getattr(func, '__module__', '?')}）")
 
     print("[3] 执行节点系统提示")
     prompt = str(getattr(main.EXECUTOR_PROMPT, "content", main.EXECUTOR_PROMPT))

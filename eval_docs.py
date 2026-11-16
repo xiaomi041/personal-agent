@@ -205,6 +205,9 @@ def part_b() -> dict:
             cite = doc_kw in raw.split("依据：")[-1] if "依据：" in raw else False
             cite_ok += cite
             details.append(("可答", q, "✅" if ok else "❌", "引用✅" if cite else "引用❌"))
+            if not ok:
+                # 失败时把模型原答打出来，否则没法判断是检索错了还是算错了
+                print(f"      ↳ 期望包含 {kw}；实际回答：{raw[:180].replace(chr(10), ' / ')}")
         else:
             refused = any(w in raw for w in ("没有", "未找到", "无相关", "无法", "不存在", "不清楚"))
             refuse_ok += refused

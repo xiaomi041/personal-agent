@@ -74,12 +74,17 @@ def make_image() -> bytes:
     img = Image.new("RGB", (900, 220), "white")
     draw = ImageDraw.Draw(img)
     font = None
-    for cand in (r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf"):
+    for cand in (
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",  # 容器内（Dockerfile 装了 fonts-wqy-zenhei）
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ):
         if Path(cand).exists():
             font = ImageFont.truetype(cand, 34)
             break
     if font is None:
-        raise RuntimeError("找不到中文字体，无法生成 OCR 样例")
+        raise RuntimeError("找不到中文字体，无法生成 OCR 样例（Windows 用 msyh/simhei，容器用 fonts-wqy-zenhei）")
     draw.text((30, 40), "扫描件测试：合同编号 A-2024-001", fill="black", font=font)
     draw.text((30, 110), "签约日期 2024 年 3 月 15 日", fill="black", font=font)
     buf = io.BytesIO()

@@ -1,15 +1,23 @@
+# 全部锁定到容器内实测通过的版本（2026-11-17）。
+# 升级任何一个都要同时跑 eval_docs.py + 三个 selftest 再合入。
 streamlit==1.65.0
-langgraph
-langgraph-checkpoint-sqlite
-langchain-core
-langchain-openai
-openai
-requests
-python-dotenv
-numpy
-pypdf
-python-docx
-python-pptx
-pymupdf
-pdfplumber
-rapidocr-onnxruntime
+
+# Agent 框架
+langgraph==1.2.21
+langgraph-checkpoint-sqlite==3.1.3
+langchain-core==1.8.0
+langchain-openai==1.7.4
+openai==3.50.0
+
+# HTTP / 配置
+requests==2.34.2
+python-dotenv==1.2.4
+
+# 文档解析
+numpy==2.5.4
+pypdf==7.0.1
+python-docx==1.2.0
+python-pptx==1.0.2
+pymupdf==2.1
+pdfplumber==0.11.10
+rapidocr-onnxruntime==1.4.4

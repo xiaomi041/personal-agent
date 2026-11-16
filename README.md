@@ -77,6 +77,26 @@
 
 **持久化层**：`agent_memory.db`（SQLite：对话 checkpoint + 提醒任务）、`sessions.json`（会话索引）、`plans.json`（任务计划）、`todos.json`（待办）、`kb/`（RAG 知识库：分块 + 向量）
 
+### 代码结构（2026-11-17 从 2000 行单体拆出）
+
+| 文件 | 行数 | 职责 |
+|---|---:|---|
+| `a.py` | ~710 | Streamlit 界面：登录网关、会话管理、四分区工作台、上传与执行过程展示 |
+| `main.py` | ~305 | 门面：LangGraph 三节点状态图、`TOOLS` 注册表，对外重新导出全部能力 |
+| `settings.py` | ~80 | 密钥、路径、常量、日志初始化（`LOG_LEVEL` 可调） |
+| `runtime.py` | ~135 | 模型工厂、`call_llm` / `call_with_retry`（指数退避）、会话 ContextVar、外部内容哨兵 |
+| `knowledge.py` | ~530 | 文档解析入库、混合检索、问答/摘要/字段抽取/文档对比、联网搜索 |
+| `store.py` | ~370 | 备忘 / 待办 / 计划 / 会话索引 |
+| `scheduler.py` | ~360 | 定时提醒、日报、后台调度线程、8600 提醒 HTTP 服务 |
+| `files.py` | ~235 | 导出 Markdown / Word / PPT，输出目录兜底 |
+| `weather.py` | ~80 | Open-Meteo 天气查询 |
+| `documents.py` | ~435 | 纯解析引擎：PDF/Word/Markdown/图片 → 带页码章节的切片 |
+| `check_names.py` | ~40 | 开发期检查：按字节码抓「引用了但没定义」的全局名 |
+
+拆分动机：原来的 `main.py` 把工具、存储、检索、HTTP 服务、状态图全塞在一起，改一处要通读两千行，评审时也无法逐块 review。按职责切开后每个模块可独立测试，`main.py` 只剩状态图与门面。
+
+**为什么用 `import *` 门面**：`a.py` 与评测脚本大量使用 `main.xxx`，保留门面可以让 20 个工具与所有辅助函数在拆分后**无需改调用方**；`check_names.py` 用于兜住 `import *` 带来的「名字没定义也能 import 成功」风险。
+
 ## 🚀 快速开始
 
 ### 环境要求
@@ -139,18 +159,46 @@ streamlit run a.py --server.port 8501
 
 ```
 personal-agent/
-├── main.py            # 核心：状态图（Planner/Executor/Critic）+ 20 个工具 + 调度器
+├── main.py            # 门面：LangGraph 状态图（Planner/Executor/Critic）+ 20 工具注册表
+├── settings.py        # 密钥、路径、常量、日志初始化
+├── runtime.py         # 模型工厂、重试、会话上下文、外部内容哨兵
+├── store.py           # 备忘 / 待办 / 计划 / 会话索引
+├── knowledge.py       # 文档入库、混合检索、问答/摘要/抽取/对比、联网搜索
+├── scheduler.py       # 定时提醒、日报、调度线程、8600 提醒服务
+├── files.py           # 导出 Markdown / Word / PPT
+├── weather.py         # Open-Meteo 天气
 ├── documents.py       # 文档解析引擎：PDF/Word/Markdown/图片 → 结构化块与切片
-├── a.py               # Streamlit 界面（侧边栏会话管理 + 四分区工作台）
+├── a.py               # Streamlit 界面（登录网关 + 会话管理 + 四分区工作台）
+├── check_names.py     # 开发期检查：抓「引用了但没定义」的全局名
 ├── kb/                # RAG 知识库（chunks.json / vectors.npy / docs.json，按会话私有）
 ├── agent_memory.db    # SQLite：对话 checkpoint + 提醒任务（git 忽略）
 ├── sessions.json      # 会话索引（git 忽略）
 ├── plans.json         # 任务计划（git 忽略）
 ├── .env               # API 密钥（git 忽略，请勿上传）
 ├── .env.example       # 配置模板
-├── requirements.txt   # 依赖清单
+├── requirements.txt   # 依赖清单（全部锁定版本）
 ├── 启动.bat / 停止.bat # Windows 一键启停脚本（本地使用，git 忽略）
 ```
+
+## 🔍 可观测性（排查问题看这里）
+
+日志默认输出到 stderr，`LOG_LEVEL` 环境变量可调（`DEBUG` / `INFO` / `WARNING`）：
+
+```bash
+docker compose logs -f personal-ai          # 跟日志
+docker compose logs personal-ai | grep 工具调用   # 只看工具调用
+LOG_LEVEL=DEBUG streamlit run a.py          # 本地调试
+```
+
+一次委托在日志里长这样（关键字段：耗时、参数摘要、输出长度，不打印全文）：
+
+```
+05:12:03 INFO  [agent.main] 工具调用 | ask_document | 1.83s | 参数 {"question": "违约金比例是多少"} | 输出 312 字
+05:12:04 INFO  [agent.runtime] LLM 调用成功 | 执行节点第 2 轮 | 第 1 次 | 2.41s
+05:12:05 INFO  [agent.main] 评审结论：通过（第 1 次）
+```
+
+**失败重试**：模型与 embedding 调用遇到超时 / 连接重置 / 429 / 5xx 会按 `1.2s → 2.4s → 4.8s` 指数退避重试（默认 3 次，`LLM_RETRY_ATTEMPTS` 可调）；参数错误、鉴权失败这类重试无意义的错误立即抛出，不浪费时间也不掩盖问题。
 
 ## 🛠️ 技术栈
 
