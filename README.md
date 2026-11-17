@@ -168,6 +168,7 @@ personal-agent/
 ├── files.py           # 导出 Markdown / Word / PPT
 ├── weather.py         # Open-Meteo 天气
 ├── documents.py       # 文档解析引擎：PDF/Word/Markdown/图片 → 结构化块与切片
+├── worker.py          # 提醒常驻进程：独立跑调度线程 + 8600 服务（compose 里的 reminder-worker）
 ├── a.py               # Streamlit 界面（登录网关 + 会话管理 + 四分区工作台）
 ├── check_names.py     # 开发期检查：抓「引用了但没定义」的全局名
 ├── kb/                # RAG 知识库（chunks.json / vectors.npy / docs.json，按会话私有）
@@ -288,6 +289,27 @@ docker run -d --name personal-ai \
 - 运行期数据（`agent_memory.db` / `sessions.json` / `plans.json` / `todos.json` / `kb/` / `memos.md`）统一落在 `DATA_DIR`（容器内 `/app/data`），挂载卷后重建容器不丢。
 - 密钥通过 `--env-file` 注入，`.dockerignore` 已排除 `.env`，不会打进镜像。
 - 与火车票项目同时部署时使用根目录的 `docker-compose.yml`；公网访问（natapp 内网穿透）见 `DEPLOY.md`。
+
+### 提醒为什么需要第二个进程（`reminder-worker`）
+
+Streamlit **只在有浏览器会话时才执行脚本**。调度线程与 8600 提醒服务都写在脚本里，
+所以没人打开页面时它们根本不存在 —— 到点提醒会静默丢失，外部服务也投递不进来。
+
+compose 里的 `reminder-worker` 就是干这件事的常驻进程：
+
+```yaml
+reminder-worker:
+  build: ./PersonalAI
+  command: ["python", "worker.py"]
+  environment:
+    ALERT_BIND: 0.0.0.0     # 只在容器网络内可达，8600 不发布到宿主机
+```
+
+配套的两个环境变量：
+- `DISABLE_INLINE_SCHEDULER=1`：Streamlit 侧不再启动内联调度，避免两个进程重复触发提醒；
+- `ALERT_API_URL`：前端轮询地址（compose 里指向 `http://reminder-worker:8600`）。
+
+只想单机跑、不想多一个容器也可以：不设 `DISABLE_INLINE_SCHEDULER`，行为与以前一致。
 
 ## 🔐 安全（公网暴露前必读）
 

@@ -2,6 +2,7 @@
 """定时提醒与自动任务：SQLite 持久化、后台调度线程、本地提醒 HTTP 服务。"""
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time as _time
@@ -269,8 +270,14 @@ def _check_due():
     conn.close()
 
 def start_scheduler():
-    """启动后台调度线程（幂等）：每 30 秒检查一次到期提醒。"""
+    """启动后台调度线程（幂等）：每 30 秒检查一次到期提醒。
+
+    在 docker-compose 里由独立的 worker 进程负责调度与 8600 服务，
+    Streamlit 侧用 DISABLE_INLINE_SCHEDULER=1 关掉，避免两个进程重复触发。
+    """
     global _scheduler_started
+    if os.getenv("DISABLE_INLINE_SCHEDULER", "0") == "1":
+        return
     if _scheduler_started:
         return
     _scheduler_started = True
@@ -323,6 +330,61 @@ class _AlertHandler(BaseHTTPRequestHandler):
         except Exception:
             self._send(500, {"error": "internal"})
 
+    def do_POST(self):
+        """供同网络的其他服务（如 trainAI 的盯票 Agent）投递提醒。
+
+        请求体：{"content": "...", "at": "YYYY-MM-DD HH:MM", "repeat": "once",
+                "token": "..."}
+        token 仅在服务端配置了 APP_PASSWORD 时校验；未配置则内网直通。
+        """
+        import os
+        from urllib.parse import urlparse
+
+        try:
+            u = urlparse(self.path)
+            if u.path != "/remind":
+                self._send(404, {"error": "not found"})
+                return
+
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except Exception:
+                self._send(400, {"error": "bad json"})
+                return
+
+            expected = (os.getenv("APP_PASSWORD") or "").strip()
+            if expected and (data.get("token") or "").strip() != expected:
+                self._send(401, {"error": "unauthorized"})
+                return
+
+            content = (data.get("content") or "").strip()
+            at = (data.get("at") or "").strip()
+            repeat = (data.get("repeat") or "once").strip()
+            if not content or not at:
+                self._send(400, {"error": "content 和 at 必填"})
+                return
+            try:
+                _parse_at(at, repeat)
+            except ValueError as e:
+                self._send(400, {"error": f"时间格式不对：{e}"})
+                return
+
+            conn = _db()
+            cur = conn.execute(
+                "INSERT INTO reminders (content, at, repeat, created_at) VALUES (?,?,?,?)",
+                (content, at, repeat, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            )
+            rid = cur.lastrowid
+            conn.commit()
+            conn.close()
+            log.info("外部提醒已入库 | id=%s | %s | %s", rid, at, content[:60])
+            self._send(200, {"ok": True, "id": rid, "at": at})
+        except Exception as e:  # 对端要能拿到原因，不能只回 500
+            log.warning("外部提醒写入失败：%r", e)
+            self._send(500, {"error": str(e)[:160]})
+
     def log_message(self, *args):
         pass
 
@@ -334,8 +396,12 @@ def start_alert_http_server():
     from http.server import ThreadingHTTPServer
 
     try:
-        _alert_server = ThreadingHTTPServer(("127.0.0.1", _ALERT_HTTP_PORT), _AlertHandler)
+        # 默认只监听回环；容器内需要被同网络的 trainAI 投递提醒时设 ALERT_BIND=0.0.0.0。
+        # 注意 8600 不通过 compose 发布到宿主机，所以绑 0.0.0.0 的影响面仅限容器网络。
+        bind = os.getenv("ALERT_BIND", "127.0.0.1").strip() or "127.0.0.1"
+        _alert_server = ThreadingHTTPServer((bind, _ALERT_HTTP_PORT), _AlertHandler)
         threading.Thread(target=_alert_server.serve_forever, daemon=True).start()
+        log.info("提醒 HTTP 服务已监听 %s:%s", bind, _ALERT_HTTP_PORT)
     except OSError as e:
         # 端口被占用说明服务已在运行；否则写日志便于排查
         try:
@@ -360,3 +426,14 @@ def mark_alerts_shown():
     conn.close()
 
 __all__ = [n for n in list(globals()) if not n.startswith("__")]
+
+
+def pending_reminders_count() -> int:
+    """worker 心跳用：当前未到点（或未清除）的提醒条数。"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        n = conn.execute("SELECT COUNT(*) FROM reminders").fetchone()[0]
+        conn.close()
+        return int(n)
+    except Exception:
+        return -1

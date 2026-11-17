@@ -78,7 +78,7 @@ main.start_scheduler()
 # 因此采用最稳方案：每次页面 rerun（用户点会话/发消息等操作）时由服务端检查提醒服务，
 # 有到点提醒则用 st.dialog 弹出模态框，必须点「确认」（ack）才关闭。
 # 已知限制：Streamlit 无法主动推送到浏览器，所以"到点自动弹"实际是"下一次交互时弹"。
-ALERT_API = "http://127.0.0.1:8600"
+ALERT_API = os.getenv("ALERT_API_URL", "http://127.0.0.1:8600")
 
 
 @st.dialog("⏰ 定时提醒", width="small")
