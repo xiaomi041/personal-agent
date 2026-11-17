@@ -262,6 +262,37 @@ def cleanup() -> None:
             pass
 
 
+# ------------------------------------------------------------------ 端到端（经状态图）
+# A/B 段直接调工具函数，绕过 Planner/Executor；这一段走完整状态图，
+# 专门防「文档明明上传了，规划节点却反问用户要文件」这类链路问题。
+E2E_CASES = [
+    ("合同里的违约金比例是多少", ("5%", "百分之五")),
+    ("总结一下我上传的文档", ("违约", "合同")),
+    ("这份合同的签订日期是哪天", ("2024", "3 月 15")),
+]
+
+
+def part_d() -> dict:
+    from langchain_core.messages import HumanMessage
+
+    ok = 0
+    details = []
+    graph = main.get_graph()
+    thread = THREAD  # 必须与语料入库同一会话，否则规划节点看不到文档
+    for q, kws in E2E_CASES:
+        res = graph.invoke(
+            {"messages": [HumanMessage(content=q)]},
+            config={"configurable": {"thread_id": thread}},
+        )
+        ans = res.get("execution_result") or ""
+        hit = any(k in ans for k in kws)
+        used_doc = ("依据：" in ans) or ("《" in ans) or ("第" in ans and "页" in ans)
+        good = hit and used_doc
+        ok += good
+        details.append((q, good, ans[:100]))
+    return {"n": len(E2E_CASES), "ok": ok, "details": details}
+
+
 def run() -> int:
     print("=== 准备语料 ===")
     prep()
@@ -294,10 +325,18 @@ def run() -> int:
         print(f"  {mark} {task:<22} 期望{'反问' if should_ask else '执行'}，实际{'反问' if asked else '执行'}")
     print(f"  澄清判定准确率：{c['ok']}/{c['n']} = {cr:.1f}%")
 
+    print("\n=== D. 端到端（经完整状态图，验文档是否真的被用上）===")
+    d = part_d()
+    for q, good, ans in d["details"]:
+        print(f"  {'✅' if good else '❌'} {q:<22} {(ans or '').replace(chr(10), ' ')[:80]}")
+    dr = d["ok"] / d["n"] * 100
+    print(f"  端到端正确率：{d['ok']}/{d['n']} = {dr:.1f}%")
+
     print("\n=== 汇总（可写入简历）===")
     print(f"  自建 {len(QA)} 条文档评测集：检索 top-3 命中率 {r3:.0f}%，"
           f"答案正确率 {ac:.0f}%，拒答准确率 {rc:.0f}%，引用准确率 {cc:.0f}%")
     print(f"  澄清判定：{c['ok']}/{c['n']} 条委托判断正确（{cr:.0f}%）")
+    print(f"  端到端（状态图）：{d['ok']}/{d['n']}（{dr:.0f}%）")
 
     print("\n=== 清理 ===")
     cleanup()

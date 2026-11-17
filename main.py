@@ -19,6 +19,7 @@ import time
 from typing import Annotated, TypedDict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
@@ -106,12 +107,35 @@ PLANNER_PROMPT = SystemMessage(
     "输出一行：'需要补充：<一句话具体问题>'。"
     "以下情况一律不要追问，直接给计划：时间和日期（有 get_today 工具）、天气（可查默认城市）、"
     "待办/计划/文档列表（有对应工具）、用户已经在上面说过的信息。"
+    "特别注意：如果「当前会话文档」一行里已经列出了文档，而任务是在问这些文档里的内容"
+    "（条款、金额、日期、比例、指标、要点等），直接计划调用 ask_document 去查，"
+    "绝对不要追问「请提供合同/文件」——文件已经上传好了。"
 )
 
-def planner_node(state: State):
+def _thread_from_config(config: RunnableConfig | dict | None) -> str:
+    """从 langgraph 的 config 里取当前会话；取不到再退回 ContextVar。"""
+    conf = (config or {}).get("configurable") or {}
+    return conf.get("thread_id") or _current_thread()
+
+def _docs_hint(thread_id: str) -> str:
+    """把当前会话已上传的文档列给规划节点，避免它明明有文档还反问用户要文件。"""
+    try:
+        docs = list_documents(thread_id) or []
+    except Exception:  # noqa: BLE001 - 文档库异常不应该拖垮规划
+        docs = []
+    if not docs:
+        return "当前会话文档：无（尚未上传任何文档）"
+    items = []
+    for d in docs[:8]:
+        name = d.get("name") or "未命名"
+        cnt = d.get("chunk_count") or 0
+        items.append(f"{name}（{cnt} 片段）")
+    return "当前会话文档：" + "、".join(items)
+
+def planner_node(state: State, config: RunnableConfig | None = None):
     user_task = _last_user_task(state)
     context = _build_context(state)
-    prompt = f"对话历史：\n{context}\n\n当前任务：{user_task}"
+    prompt = f"对话历史：\n{context}\n\n{_docs_hint(_thread_from_config(config))}\n\n当前任务：{user_task}"
     resp = call_llm(deepseek_model(), [PLANNER_PROMPT, HumanMessage(content=prompt)], what="规划节点")
     note_plan()
     plan = (resp.content or "").strip()
