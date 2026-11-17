@@ -182,21 +182,30 @@ personal-agent/
 
 ## 🔍 可观测性（排查问题看这里）
 
-日志默认输出到 stderr，`LOG_LEVEL` 环境变量可调（`DEBUG` / `INFO` / `WARNING`）：
+**界面里看**：侧边栏「📊 运行统计（本进程）」直接显示累计的模型调用次数、失败次数、输入/输出 token、平均耗时、工具调用数与失败数、规划次数、评审返工次数。重启容器清零。
+
+**命令行看**：日志默认输出到 stderr，`LOG_LEVEL` 环境变量可调（`DEBUG` / `INFO` / `WARNING`）：
 
 ```bash
-docker compose logs -f personal-ai          # 跟日志
+docker compose logs -f personal-ai              # 跟日志
 docker compose logs personal-ai | grep 工具调用   # 只看工具调用
-LOG_LEVEL=DEBUG streamlit run a.py          # 本地调试
+LOG_LEVEL=DEBUG streamlit run a.py              # 本地调试
 ```
 
-一次委托在日志里长这样（关键字段：耗时、参数摘要、输出长度，不打印全文）：
+Windows 下双击根目录的 `查看日志.bat` 即可实时看两个项目的日志。
+
+一次委托在日志里长这样（含向量化、token 用量、耗时，不打印全文）：
 
 ```
-05:12:03 INFO  [agent.main] 工具调用 | ask_document | 1.83s | 参数 {"question": "违约金比例是多少"} | 输出 312 字
-05:12:04 INFO  [agent.runtime] LLM 调用成功 | 执行节点第 2 轮 | 第 1 次 | 2.41s
-05:12:05 INFO  [agent.main] 评审结论：通过（第 1 次）
+16:35:56 INFO  [agent.runtime] LLM 调用成功 | 规划节点 | 第 1 次 | 0.73s | 输入 143 / 输出 20 tokens
+16:35:57 INFO  [agent.main] 规划完成：计划：①调用 get_today 工具获取当前日期和时间 ②将结果告知用户
+16:35:57 INFO  [agent.runtime] LLM 调用成功 | 执行节点第 1 轮 | 第 1 次 | 0.80s | 输入 2488 / 输出 22 tokens
+16:35:57 INFO  [agent.main] 工具调用 | get_today | 0.00s | 参数 {} | 输出 51 字
+16:35:58 INFO  [agent.main] 工具循环结束 | 第 2 轮 | 共 1 次工具调用
+16:35:58 INFO  [agent.main] 评审结论：通过（第 1 次）
 ```
+
+**一次真实委托的账**（上面这段）：4 次模型调用、5488 输入 token / 64 输出 token、3.1 秒 —— 输入远大于输出，因为每轮执行都要带上完整上下文与工具结果，这也是"多轮工具循环贵在哪"的直接证据。
 
 **失败重试**：模型与 embedding 调用遇到超时 / 连接重置 / 429 / 5xx 会按 `1.2s → 2.4s → 4.8s` 指数退避重试（默认 3 次，`LLM_RETRY_ATTEMPTS` 可调）；参数错误、鉴权失败这类重试无意义的错误立即抛出，不浪费时间也不掩盖问题。
 

@@ -113,6 +113,7 @@ def planner_node(state: State):
     context = _build_context(state)
     prompt = f"对话历史：\n{context}\n\n当前任务：{user_task}"
     resp = call_llm(deepseek_model(), [PLANNER_PROMPT, HumanMessage(content=prompt)], what="规划节点")
+    note_plan()
     plan = (resp.content or "").strip()
 
     # 关键信息缺失 → 直接向用户澄清，不进入执行（避免瞎猜参数）
@@ -175,7 +176,9 @@ def _run_tool_loop(model, messages, max_iters=6):
             else:
                 try:
                     result = fn.invoke(tc["args"])
+                    note_tool(True)
                 except Exception as e:
+                    note_tool(False)
                     log.exception("工具执行出错：%s(%s)", tc["name"], tc["args"])
                     result = f"工具执行出错：{e}"
                 messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
@@ -240,6 +243,8 @@ def critic_node(state: State):
     )
     resp = call_llm(qwen_model(), [CRITIC_PROMPT, HumanMessage(content=material)], what="评审节点")
     verdict = "需修正" if "需修正" in (resp.content or "") else "通过"
+    if verdict == "需修正":
+        note_rework()
     log.info("评审结论：%s（第 %d 次）", verdict, state.get("retry_count", 0) + 1)
     return {
         "review": resp.content,

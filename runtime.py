@@ -47,6 +47,49 @@ def _is_retryable(exc: Exception) -> bool:
     return False
 
 
+def _read_usage(resp) -> tuple:
+    """从模型响应里取 token 用量，取不到就返回 (0, 0)。"""
+    usage = getattr(resp, "usage_metadata", None) or {}
+    if usage:
+        return int(usage.get("input_tokens") or 0), int(usage.get("output_tokens") or 0)
+    meta = getattr(resp, "response_metadata", None) or {}
+    tu = meta.get("token_usage") or meta.get("usage") or {}
+    if tu:
+        return int(tu.get("prompt_tokens") or 0), int(tu.get("completion_tokens") or 0)
+    return 0, 0
+
+
+# 进程级累计用量：打开侧边栏「运行统计」就能看到，不用翻日志
+_USAGE = {"calls": 0, "fail": 0, "in": 0, "out": 0, "seconds": 0.0}
+_TOOLS = {"calls": 0, "fail": 0}
+_ROUNDS = {"plan": 0, "rework": 0}
+
+
+def usage_snapshot() -> dict:
+    """当前进程累计：模型调用次数、失败次数、输入/输出 token、总耗时，以及工具与返工计数。"""
+    snap = dict(_USAGE)
+    snap.update({"tool_calls": _TOOLS["calls"], "tool_fail": _TOOLS["fail"],
+                 "plans": _ROUNDS["plan"], "rework": _ROUNDS["rework"]})
+    snap["avg_seconds"] = (snap["seconds"] / snap["calls"]) if snap["calls"] else 0.0
+    return snap
+
+
+def note_tool(ok: bool) -> None:
+    """记一次工具调用的成败（供运行统计用）。"""
+    _TOOLS["calls"] += 1
+    if not ok:
+        _TOOLS["fail"] += 1
+
+
+def note_plan() -> None:
+    _ROUNDS["plan"] += 1
+
+
+def note_rework() -> None:
+    """Critic 判不通过、触发返工时调用，用来观测返工率。"""
+    _ROUNDS["rework"] += 1
+
+
 def call_llm(model, messages, what: str = "", attempts: int = RETRY_ATTEMPTS):
     """带指数退避的模型调用。失败会重试并在日志里留痕，最终仍失败才抛出。"""
     last = None
@@ -55,12 +98,19 @@ def call_llm(model, messages, what: str = "", attempts: int = RETRY_ATTEMPTS):
         try:
             resp = model.invoke(messages)
             cost = time.time() - started
-            log.info("LLM 调用成功 | %s | 第 %d 次 | %.2fs", what or "-", i, cost)
+            in_tok, out_tok = _read_usage(resp)
+            _USAGE["calls"] += 1
+            _USAGE["in"] += in_tok
+            _USAGE["out"] += out_tok
+            _USAGE["seconds"] += cost
+            log.info("LLM 调用成功 | %s | 第 %d 次 | %.2fs | 输入 %d / 输出 %d tokens",
+                     what or "-", i, cost, in_tok, out_tok)
             return resp
         except Exception as e:  # noqa: BLE001
             last = e
             retryable = _is_retryable(e)
             if i == attempts or not retryable:
+                _USAGE["fail"] += 1
                 log.error("LLM 调用失败 | %s | 第 %d/%d 次 | 不可重试=%s | %s",
                           what or "-", i, attempts, not retryable, e)
                 raise

@@ -162,6 +162,21 @@ with st.sidebar:
         st.rerun()
     st.caption("💡 会话会持续累积记忆，不同会话记忆不共存。")
 
+    # 可观测性：进程级累计指标（不用翻日志就能看系统健不健康）
+    with st.expander("📊 运行统计（本进程）", expanded=False):
+        _st = main.usage_snapshot()
+        st.caption("容器启动以来累计，重启清零")
+        _c1, _c2 = st.columns(2)
+        _c1.metric("模型调用", _st["calls"], help="含规划 / 执行 / 评审全部调用")
+        _c2.metric("失败", _st["fail"], help="重试后仍失败才计一次")
+        _c1.metric("输入 tokens", f"{_st['in']:,}")
+        _c2.metric("输出 tokens", f"{_st['out']:,}")
+        _c1.metric("平均耗时", f"{_st['avg_seconds']:.2f}s")
+        _c2.metric("工具调用", _st["tool_calls"])
+        st.caption(
+            f"工具失败 {_st['tool_fail']} · 规划 {_st['plans']} 次 · 评审返工 {_st['rework']} 次"
+        )
+
     # tabs 分区：未激活 tab 前端不渲染，大幅减小 rerun 时的 DOM 组件树，
     # 根治 Streamlit 1.65 在大型侧边栏下的 removeChild 竞态
     tab_conv, tab_todo, tab_plan, tab_doc = st.tabs(
