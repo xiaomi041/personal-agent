@@ -61,6 +61,8 @@ def _read_usage(resp) -> tuple:
 
 # 进程级累计用量：打开侧边栏「运行统计」就能看到，不用翻日志
 _USAGE = {"calls": 0, "fail": 0, "in": 0, "out": 0, "seconds": 0.0}
+# 引用校验：pass = 模型主动标了片段编号；repaired = 补一次纠正才达标；rejected = 仍无依据被降级
+_CITE = {"pass": 0, "repaired": 0, "rejected": 0}
 _TOOLS = {"calls": 0, "fail": 0}
 _ROUNDS = {"plan": 0, "rework": 0}
 
@@ -69,7 +71,9 @@ def usage_snapshot() -> dict:
     """当前进程累计：模型调用次数、失败次数、输入/输出 token、总耗时，以及工具与返工计数。"""
     snap = dict(_USAGE)
     snap.update({"tool_calls": _TOOLS["calls"], "tool_fail": _TOOLS["fail"],
-                 "plans": _ROUNDS["plan"], "rework": _ROUNDS["rework"]})
+                 "plans": _ROUNDS["plan"], "rework": _ROUNDS["rework"],
+                 "cite_pass": _CITE["pass"], "cite_repaired": _CITE["repaired"],
+                 "cite_rejected": _CITE["rejected"]})
     snap["avg_seconds"] = (snap["seconds"] / snap["calls"]) if snap["calls"] else 0.0
     return snap
 
@@ -187,3 +191,10 @@ def bind_thread(thread_id: str):
 
 
 __all__ = [n for n in list(globals()) if not n.startswith("__")]
+
+
+def note_cite(status: str) -> None:
+    """记一次文档问答的引用校验结果（pass / repaired / rejected）。"""
+    key = {"pass": "pass", "passed": "pass"}.get(status, status)
+    if key in _CITE:
+        _CITE[key] += 1

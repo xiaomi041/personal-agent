@@ -157,7 +157,8 @@ TASKS = [
 
     # ---- 天气/联网（3）
     ("天气联网", "查天气", ["十堰明天天气怎么样"],
-     lambda a, t: has(a, "°", "度", "温") ),
+     # 第 5 次判分修正：模型写的是「℃」(U+2103)，判分只认 "°"(U+00B0)，白记一次失败。
+     lambda a, t: has(a, "°", "℃", "度", "温")),
     ("天气联网", "联网搜索", ["联网查一下 DeepSeek 是什么公司"],
      lambda a, t: has(a, "DeepSeek", "深度求索", "幻方", "模型")),
     ("天气联网", "搜索存知识库", ["搜一下 LangGraph 是什么，并存到知识库"],
@@ -276,11 +277,16 @@ def main_() -> int:
     print("任务级评测：一整句委托丢进状态图，看结果对不对 + 花了多少")
     print("=" * 72)
 
+    only = os.getenv("BENCH_ONLY", "").strip()
+    cases = [t for t in TASKS if only in t[1]] if only else list(TASKS)
+    if only:
+        print(f"（只跑名字含「{only}」的任务：{len(cases)} 条）")
+
     prep()
-    print(f"语料就绪（{len(DOCS)} 份文档），开始跑 {len(TASKS)} 个任务…\n")
+    print(f"语料就绪（{len(DOCS)} 份文档），开始跑 {len(cases)} 个任务…\n")
 
     rows = []
-    for cat, name, turns, check in TASKS:
+    for cat, name, turns, check in cases:
         try:
             r = run_task(turns)  # 内部已含突发限流重试
             ok = bool(check(r["ans"], r["trace"]))
