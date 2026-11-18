@@ -38,6 +38,27 @@ def _embed_texts(texts: list) -> list:
     log.info("向量化完成 | %d 条文本 → %d 个向量", total, len(out))
     return out
 
+_EMBED_DOWN = False  # 向量服务不可用时置真，避免每条日志刷一次错
+
+
+def _embed_texts_soft(texts: list):
+    """_embed_texts 的"可降级"版本：向量服务不可用时返回 None，而不是抛异常。
+
+    阿里云百炼欠费/鉴权失败时 embedding 会返回 400，此时整条入库与检索链路都会断。
+    正确的降级是：文档照常入库（只建关键词索引），检索退化成 BM25 单路——
+    效果差一些，但"问得到"永远好过"整条链路 500"。
+    """
+    global _EMBED_DOWN
+    if _EMBED_DOWN:
+        return None
+    try:
+        return _embed_texts(texts)
+    except Exception as e:  # noqa: BLE001
+        _EMBED_DOWN = True
+        log.warning("向量服务不可用，降级为关键词检索（BM25）：%s", str(e)[:160])
+        return None
+
+
 def _load_kb():
     chunks = (
         json.loads(KB_CHUNKS.read_text(encoding="utf-8"))
@@ -85,7 +106,13 @@ def add_document(filename: str, content: bytes, thread_id: str = "user-main") ->
     if not new_chunks:
         raise ValueError("文档内容为空或无法提取文字")
 
-    vecs_new = np.array(_embed_texts([c.text for c in new_chunks]), dtype="float32")
+    raw_vecs = _embed_texts_soft([c.text for c in new_chunks])
+    degraded = raw_vecs is None
+    if degraded:
+        dim = vecs_old.shape[1] if len(vecs_old) else 1024
+        vecs_new = np.zeros((len(new_chunks), dim), dtype="float32")
+    else:
+        vecs_new = np.array(raw_vecs, dtype="float32")
 
     # 同名文档覆盖：先摘掉旧片段，再追加新片段（避免同一份文件多版本共存）
     keep = [i for i, c in enumerate(chunks_old) if not (c["thread_id"] == thread_id and c["doc"] == filename)]
@@ -116,6 +143,7 @@ def add_document(filename: str, content: bytes, thread_id: str = "user-main") ->
         "ocr_count": sum(1 for c in new_chunks if c.kind == "image"),
         "sha256": digest,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "degraded": degraded,  # True = 向量服务当时不可用，只建了关键词索引
     })
     _save_kb(chunks_old, vecs, docs)
 
@@ -127,9 +155,11 @@ def add_document(filename: str, content: bytes, thread_id: str = "user-main") ->
     if docs[-1]["ocr_count"]:
         extra.append(f"{docs[-1]['ocr_count']} 段 OCR")
     suffix = ("，含 " + "、".join(extra)) if extra else ""
-    log.info("文档入库 | %s | 会话 %s | %d 片段 | %d 页 | %d 表格 | %d OCR | sha256 %s",
+    if degraded:
+        suffix += "（向量服务不可用，本次仅建立关键词索引，检索质量会下降）"
+    log.info("文档入库 | %s | 会话 %s | %d 片段 | %d 页 | %d 表格 | %d OCR | sha256 %s | 降级=%s",
              filename, thread_id, len(new_chunks), len(pages),
-             docs[-1]["table_count"], docs[-1]["ocr_count"], digest[:8])
+             docs[-1]["table_count"], docs[-1]["ocr_count"], digest[:8], degraded)
     return f"已读入《{filename}》：{len(new_chunks)} 个知识片段{suffix}，可以直接问我"
 
 def list_documents(thread_id: str = None) -> list:
@@ -277,14 +307,28 @@ def search_documents(query: str, top_k: int = 5, thread_id: str = None,
         vecs = vecs[keep]
     if not chunks:
         return []
-    qv = np.array(_embed_texts([query])[0], dtype="float32")
-    qn = np.linalg.norm(qv) + 1e-9
-    norms = np.linalg.norm(vecs, axis=1, keepdims=True).ravel() + 1e-9
-    cosine = (vecs @ qv) / (norms * qn)
+    # 向量服务不可用时不整条链路挂掉：查询向量退化为 None，改由 BM25 单路排序。
+    qv_raw = _embed_texts_soft([query])
+    if qv_raw is None:
+        vecs = None
+        qv = None
+    else:
+        qv = np.array(qv_raw[0], dtype="float32")
 
     # 混合检索：向量语义 + BM25 精确词，两路加权融合
     bm25 = _bm25_scores(query, [c["text"] for c in chunks])
-    adjusted = 0.7 * cosine + 0.3 * bm25
+    if vecs is None or not len(vecs):
+        adjusted = 0.9 * bm25
+        cosine = np.zeros(len(chunks), dtype="float32")
+        mode = "bm25"
+    else:
+        qn = np.linalg.norm(qv) + 1e-9
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True).ravel() + 1e-9
+        cosine = (vecs @ qv) / (norms * qn)
+        # 入库时向量服务若挂过，这些切片的向量是占位零向量：只让 BM25 说话
+        has_vec = norms > 1e-5
+        adjusted = np.where(has_vec, 0.7 * cosine + 0.3 * bm25, 0.9 * bm25)
+        mode = "hybrid"
 
     idx = np.argsort(-adjusted)[:top_k]
     return [
@@ -298,6 +342,7 @@ def search_documents(query: str, top_k: int = 5, thread_id: str = None,
             "score": float(adjusted[i]),
             "cosine": float(cosine[i]),
             "bm25": float(bm25[i]),
+            "mode": mode,
         }
         for i in idx
         if float(adjusted[i]) >= min_score

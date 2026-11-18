@@ -265,14 +265,26 @@ def critic_node(state: State):
         f"工具调用证据链：\n{state['execution_trace']}\n"
         f"执行结果：{state['execution_result']}"
     )
-    resp = call_llm(qwen_model(), [CRITIC_PROMPT, HumanMessage(content=material)], what="评审节点")
-    verdict = "需修正" if "需修正" in (resp.content or "") else "通过"
+    try:
+        resp = call_llm(qwen_model(), [CRITIC_PROMPT, HumanMessage(content=material)], what="评审节点")
+        content = resp.content or ""
+    except Exception as e:  # noqa: BLE001
+        # 评审模型（Qwen）欠费/不可用时不能把整条委托打断：
+        # 降级为"评审跳过"，并在回答里明说本轮没经过二次校验。
+        log.warning("评审模型不可用，本轮跳过评审：%s", str(e)[:160])
+        content = f"评审跳过：独立评审模型不可用（{type(e).__name__}），本轮结果未经二次校验。"
+        return {
+            "review": content,
+            "messages": [AIMessage(content=f"[评审] {content}")],
+            "retry_count": state.get("retry_count", 0) + 1,
+        }
+    verdict = "需修正" if "需修正" in content else "通过"
     if verdict == "需修正":
         note_rework()
     log.info("评审结论：%s（第 %d 次）", verdict, state.get("retry_count", 0) + 1)
     return {
-        "review": resp.content,
-        "messages": [AIMessage(content=f"[评审] {resp.content}")],
+        "review": content,
+        "messages": [AIMessage(content=f"[评审] {content}")],
         "retry_count": state.get("retry_count", 0) + 1,
     }
 
