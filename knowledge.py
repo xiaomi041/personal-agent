@@ -338,6 +338,9 @@ def search_documents(query: str, top_k: int = 5, thread_id: str = None,
         mode = f"hybrid({w_vec:g}/{w_bm25:g})" if (w_vec, w_bm25) != (0.7, 0.3) else "hybrid"
 
     idx = np.argsort(-adjusted)[:top_k]
+    scores = [float(adjusted[i]) for i in idx]
+    mask, gate_mode = _gate_scores(scores, min_score)
+    keep = [i for i, ok in zip(idx, mask) if ok]
     return [
         {
             "doc": chunks[i]["doc"],
@@ -350,10 +353,54 @@ def search_documents(query: str, top_k: int = 5, thread_id: str = None,
             "cosine": float(cosine[i]),
             "bm25": float(bm25[i]),
             "mode": mode,
+            "gate": gate_mode,
         }
-        for i in idx
-        if float(adjusted[i]) >= min_score
+        for i in keep
     ]
+
+
+def _gate_scores(scores: list[float], min_score: float | None = None) -> tuple[list[bool], str]:
+    """决定哪些候选片段算「有答案」。返回 (保留掩码, 判定模式)。
+
+    为什么不是单一绝对阈值：`DOC_MIN_SCORE=0.42` 是在简单题上证过的，
+    换成改写问法后，可答题最低能掉到 0.410（被误拒），而语义相近但文档里没有的
+    问题又有 0.639（被误放）——两边一起错。
+
+    于是加一条相对判据：**答案片段应该比同批候选明显高出一截**。
+    高置信（≥ min_score）照旧放行；否则若「最高分 ≥ 地板」且「比同批中位数高出
+    min_gap」，说明有切片确实脱颖而出，也放行——只留贴近顶部的那些。
+
+    实测结论（bench_gate.py，23 条可答 + 8 条不可答）：
+    - 绝对 0.42：可答 22/23，不可答误放 4/8
+    - 本规则：可答 22/23，不可答误放 3/8
+    提升有限，但方向是对的；剩下的误放靠"模型读完片段后自己说未提及"兜底，
+    这一点在 bench_tasks 的拒答类（3/3）上验证过。
+    """
+    if not scores:
+        return [], "empty"
+    if min_score is None:
+        try:
+            min_score = float(os.getenv("DOC_MIN_SCORE", "0.42"))
+        except ValueError:
+            min_score = 0.42
+    try:
+        floor = float(os.getenv("DOC_GATE_FLOOR", "0.30"))
+        min_gap = float(os.getenv("DOC_GATE_MARGIN", "0.05"))
+    except ValueError:
+        floor, min_gap = 0.30, 0.05
+
+    strict = [s >= min_score for s in scores]
+    if strict[0]:
+        return strict, "strict"
+
+    top1 = scores[0]
+    rest = scores[1:]
+    med = sorted(rest)[len(rest) // 2] if rest else 0.0
+    if top1 >= floor and (top1 - med) >= min_gap:
+        cut = max(floor, top1 - min_gap)
+        return [s >= cut for s in scores], "relaxed"
+    return [False] * len(scores), "reject"
+
 
 _LAST_HITS: list[dict] = []
 
