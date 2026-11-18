@@ -299,6 +299,13 @@ def search_documents(query: str, top_k: int = 5, thread_id: str = None,
         except ValueError:
             min_score = 0.42
     chunks, vecs, _ = _load_kb()
+    # 两路权重可配：DOC_VEC_WEIGHT / DOC_BM25_WEIGHT。
+    # 有了旋钮，bench_hard.py 才能在同一份语料上做 A/B（纯向量 / 纯关键词 / 混合）。
+    try:
+        w_vec = float(os.getenv("DOC_VEC_WEIGHT", "0.7"))
+        w_bm25 = float(os.getenv("DOC_BM25_WEIGHT", "0.3"))
+    except ValueError:
+        w_vec, w_bm25 = 0.7, 0.3
     if thread_id is not None:
         keep = [i for i, c in enumerate(chunks) if c["thread_id"] == thread_id]
         if not keep:
@@ -327,8 +334,8 @@ def search_documents(query: str, top_k: int = 5, thread_id: str = None,
         cosine = (vecs @ qv) / (norms * qn)
         # 入库时向量服务若挂过，这些切片的向量是占位零向量：只让 BM25 说话
         has_vec = norms > 1e-5
-        adjusted = np.where(has_vec, 0.7 * cosine + 0.3 * bm25, 0.9 * bm25)
-        mode = "hybrid"
+        adjusted = np.where(has_vec, w_vec * cosine + w_bm25 * bm25, 0.9 * bm25)
+        mode = f"hybrid({w_vec:g}/{w_bm25:g})" if (w_vec, w_bm25) != (0.7, 0.3) else "hybrid"
 
     idx = np.argsort(-adjusted)[:top_k]
     return [

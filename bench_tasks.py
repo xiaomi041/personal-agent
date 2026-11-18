@@ -39,13 +39,25 @@ def has(text: str, *words) -> bool:
 
 
 def has_amount(text: str, value: int) -> bool:
-    """金额判定：容忍 10000 / 10,000 / 1 万 / 一万元 等写法。"""
-    if str(value) in text.replace(",", ""):
+    """金额判定：容忍 10000 / 10,000 / 1 万元 / 一万元 / 两万 等写法。
+
+    这一版是第三稿。前两稿都被真实输出打了脸：模型写「1 万元」，
+    第一稿找 "1 万"（原文是「1 万 元」，中间有空格）漏判；
+    第二稿找「一万」，模型写的是阿拉伯数字「1」。判分函数比模型还脆，就不是好评测。
+    """
+    t = re.sub(r"\s+", "", text.replace(",", "").replace("，", ""))
+    if str(value) in t:
         return True
-    if value >= 10000 and f"{value // 10000} 万" in text.replace("万元", " 万"):
-        return True
-    zh = {10000: "一万", 20000: "两万"}
-    return zh.get(value, "") != "" and zh[value] in text
+    for m in re.finditer(r"(\d+(?:\.\d+)?)万", t):
+        if abs(float(m.group(1)) * 10000 - value) < 1:
+            return True
+    zh = {"一": 1, "两": 2, "二": 2, "三": 3, "四": 4, "五": 5,
+          "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+    for m in re.finditer(r"([一两二三四五六七八九十]+)万", t):
+        n = zh.get(m.group(1)) if len(m.group(1)) == 1 else None
+        if n is not None and n * 10000 == value:
+            return True
+    return False
 
 
 def refused(text: str) -> bool:
@@ -105,8 +117,11 @@ TASKS = [
      lambda a, t: has(a, "蓝鲸")),
 
     # ---- 文档·结构化（3）
-    ("文档·结构化", "字段抽取", ["把合作协议的关键字段抽出来：甲方、乙方、金额"],
-     lambda a, t: has(a, "甲方") and has(a, "乙方") and has(a, "5%", "违约金", "10000")),
+    # 注意：这份合成合同里没有甲方/乙方的具体名称，也没写合同总额数值。
+    # 早先这一条要求抽出「甲方、乙方、金额」，模型如实回答「文档未提及」却被判失败——
+    # 是任务问了一个不存在的字段，不是产品答错。改成文档里确实有的字段。
+    ("文档·结构化", "字段抽取", ["把合作协议的关键字段抽出来：违约金比例、保证金、争议解决方式"],
+     lambda a, t: has(a, "5%", "百分之五") and has(a, "10000", "一万") and has(a, "仲裁")),
     ("文档·结构化", "双文档对比", ["合作协议和产品手册在关键约定上有什么不同"],
      lambda a, t: has(a, "合作协议") and has(a, "产品手册")),
     ("文档·结构化", "摘要全部", ["把我上传的文档都总结一下"],
