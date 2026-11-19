@@ -72,26 +72,20 @@ st.caption("LangGraph 状态图 · DeepSeek 规划/执行 + Qwen 评审 · SQLit
 # 所以即使通过 natapp 走公网访问，8600 也只在本机/容器内回环，链路依然成立。
 main.start_scheduler()
 
-# ---------- 定时提醒弹窗（无 iframe / 无 fragment 方案，根治 DOM 竞态） ----------
-# 说明：Streamlit 1.65 下 st.components.html(iframe) 每次 rerun 重建报 removeChild；
-# st.fragment(run_every=5) 定时刷新报 insertBefore（均实测确认）；st.html 的 script 不执行。
-# 因此采用最稳方案：每次页面 rerun（用户点会话/发消息等操作）时由服务端检查提醒服务，
-# 有到点提醒则用 st.dialog 弹出模态框，必须点「确认」（ack）才关闭。
-# 已知限制：Streamlit 无法主动推送到浏览器，所以"到点自动弹"实际是"下一次交互时弹"。
+# ---------- 定时提醒：页面内提示条（不再是模态框 + st.stop） ----------
+# 以前的做法是「有未确认提醒就弹 st.dialog，然后 st.stop() 终止本轮渲染」。
+# 代价是：提醒服务和界面在同一个进程里，ACK 一失败（服务刚重启、8600 还没起），
+# 那条提醒就永远处于未确认状态 —— 于是每次 rerun 都弹窗、都 stop，
+# 用户看到的就是「登录完只剩一个确认按钮，什么都点不了」。这个坑踩过三次。
+#
+# 现在的做法：
+#   * 提示条渲染在页面顶部，不再终止渲染，其余功能照常可用；
+#   * 每个提醒单独「确认」，也可以「全部确认」，还可以「10 分钟后再提醒」；
+#   * ACK 失败时本地也把它标记为已读（只影响本会话显示），避免锁死；
+#   * 侧边栏常驻一个未确认角标，提示条被延后也不会漏。
+# 唯一保留的旧限制：Streamlit 不能主动推送到浏览器，所以是「下次交互时出现」。
 ALERT_API = os.getenv("ALERT_API_URL", "http://127.0.0.1:8600")
-
-
-@st.dialog("⏰ 定时提醒", width="small")
-def alert_dialog(a):
-    st.markdown(f"**{a.get('content', '')}**")
-    st.caption("触发时间：" + a.get("fired_at", ""))
-    if st.button("确认"):
-        try:
-            requests.get(f"{ALERT_API}/ack?id={a['id']}", timeout=3)
-        except Exception:
-            pass
-        st.session_state["__alert_dialog_open"] = None
-        st.rerun()
+ALERT_SNOOZE_SECONDS = int(os.getenv("ALERT_SNOOZE_SECONDS", "600"))
 
 
 def _check_alerts():
@@ -102,17 +96,68 @@ def _check_alerts():
         return []
 
 
-if "__alert_dialog_open" not in st.session_state:
-    st.session_state["__alert_dialog_open"] = None
+def _ack_alert(alert_id) -> bool:
+    try:
+        r = requests.get(f"{ALERT_API}/ack?id={alert_id}", timeout=3)
+        return bool(r.ok)
+    except Exception:
+        return False
 
-if not st.session_state["__alert_dialog_open"]:
-    _alerts = _check_alerts()
-    if _alerts:
-        st.session_state["__alert_dialog_open"] = _alerts[0]["id"]
-        alert_dialog(_alerts[0])
-        # 关键：弹窗时立即停止本轮渲染，避免"弹窗 + 消息/页面更新"并发导致
-        # Streamlit 1.65 的 removeChild/insertBefore 竞态。确认关闭后才继续渲染。
-        st.stop()
+
+def _alert_muted() -> set:
+    # 本会话内已经处理过（或 ACK 失败被本地放过）的提醒 id
+    if "__alert_muted" not in st.session_state:
+        st.session_state["__alert_muted"] = set()
+    return st.session_state["__alert_muted"]
+
+
+def _pending_alerts() -> list:
+    muted = _alert_muted()
+    return [a for a in _check_alerts() if a.get("id") not in muted]
+
+
+def render_alerts() -> None:
+    """页面顶部的提醒提示条。不调用 st.stop()，失败也不锁死界面。"""
+    alerts = _pending_alerts()
+    if not alerts:
+        return
+
+    snoozed = time.time() < st.session_state.get("__alert_snooze_until", 0)
+    if snoozed:
+        st.caption(f"⏰ 还有 {len(alerts)} 条提醒未确认（已延后，侧边栏可随时处理）")
+        return
+
+    with st.container(border=True):
+        st.markdown(f"⏰ **{len(alerts)} 条提醒到点了**")
+        for a in alerts[:3]:
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.markdown(f"{a.get('content', '')}")
+                st.caption("触发时间：" + str(a.get("fired_at", "")))
+            with c2:
+                if st.button("确认", key=f"ack_{a.get('id')}", use_container_width=True):
+                    if not _ack_alert(a.get("id")):
+                        st.toast("提醒服务没响应，本次只在本页标为已读", icon="⚠️")
+                    _alert_muted().add(a.get("id"))
+                    st.rerun()
+        if len(alerts) > 3:
+            st.caption(f"另有 {len(alerts) - 3} 条，见侧边栏")
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("全部确认", key="ack_all", use_container_width=True):
+                failed = [a.get("id") for a in alerts if not _ack_alert(a.get("id"))]
+                _alert_muted().update(a.get("id") for a in alerts)
+                if failed:
+                    st.toast(f"{len(failed)} 条没发到提醒服务，已在本页标为已读", icon="⚠️")
+                st.rerun()
+        with b2:
+            if st.button("10 分钟后再提醒", key="snooze_alerts", use_container_width=True):
+                st.session_state["__alert_snooze_until"] = time.time() + ALERT_SNOOZE_SECONDS
+                st.rerun()
+
+
+render_alerts()
+
 
 
 @st.cache_resource
@@ -161,6 +206,19 @@ with st.sidebar:
         main.register_session(new_tid, "")  # 立即可在历史列表看到「新会话」
         st.rerun()
     st.caption("💡 会话会持续累积记忆，不同会话记忆不共存。")
+
+    # 未确认提醒常驻角标：提示条被「延后」或已经滚出屏幕时，这里仍然看得见
+    _pend = _pending_alerts()
+    if _pend:
+        st.warning(f"⏰ {len(_pend)} 条提醒未确认（页面顶部可处理）", icon="⏰")
+        with st.expander("📋 未确认提醒", expanded=False):
+            for _a in _pend[:10]:
+                st.caption(f"· {_a.get('content', '')}（{_a.get('fired_at', '')}）")
+            if st.button("全部确认", key="sb_ack_all", use_container_width=True):
+                for _a in _pend:
+                    _ack_alert(_a.get("id"))
+                    _alert_muted().add(_a.get("id"))
+                st.rerun()
 
     # 可观测性：进程级累计指标（不用翻日志就能看系统健不健康）
     with st.expander("📊 运行统计（本进程）", expanded=False):
