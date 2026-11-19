@@ -36,3 +36,7 @@ kb/
 outputs/
 todos.json
 _tmp/
+
+# 运行态数据库（本地/容器生成，不能进仓库）
+*.db
+*.db-*
