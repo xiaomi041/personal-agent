@@ -110,7 +110,7 @@ def _group_by_thread(rows: list) -> list:
     return sorted(groups.values(), key=lambda gs: int(gs[0]["id"]))
 
 
-def resume_goals(limit: int = 2, graph=None, concurrency: int | None = None) -> dict:
+def resume_goals(limit: int | None = None, graph=None, concurrency: int | None = None) -> dict:
     """扫一遍"停在半路"的目标，把它们接着跑完。
 
     并发策略：**按会话分组、组间并行、组内串行**。
@@ -120,6 +120,10 @@ def resume_goals(limit: int = 2, graph=None, concurrency: int | None = None) -> 
 
     返回 {"picked": n, "done": n, "failed": n, "left": n, "skipped": n, "groups": n}。
     """
+    # 每轮捞多少条：默认等于并发度，否则并发再多也只有一个并发度的活可干。
+    width_cap = max(1, int(concurrency or GOAL_CONCURRENCY))
+    if limit is None:
+        limit = width_cap
     rows = goals.stale(GOAL_STALE, limit=limit) if GOAL_RESUME else []
     out = {"picked": len(rows), "done": 0, "failed": 0, "left": 0,
            "skipped": 0, "groups": 0}
