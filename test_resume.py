@@ -138,5 +138,36 @@ goals.reset()
 out = worker.resume_goals(graph=FakeGraph())
 ok("空队列 picked=0", out == {"picked": 0, "done": 0, "failed": 0, "left": 0}, out)
 
+# ---------------- 6. 完成要写提醒弹窗 ----------------
+check("6. 目标完成写一条提醒（用户不必盯着页面）")
+import scheduler as _sched  # noqa: E402
+
+goals.reset()
+alerts = []
+_orig_push = _sched.push_alert
+_sched.push_alert = lambda content: alerts.append(content) or 1
+try:
+    g4 = goals.add_goal("t-d", "查明天北京天气", "①查天气", ["给出温度"])
+    age(g4, 999)
+    out = worker.resume_goals(graph=FakeGraph(finish="done"))
+    ok("续跑成功", out["done"] == 1, out)
+    ok("写了一条提醒", len(alerts) == 1, alerts)
+    ok("提醒里有「目标完成」", alerts and "目标完成" in alerts[0], alerts)
+    ok("提醒里带原委托", alerts and "查明天北京天气" in alerts[0], alerts)
+
+    # 通知本身失败不能影响续跑结果
+    def _boom(_content):
+        raise RuntimeError("弹窗库挂了")
+
+    _sched.push_alert = _boom
+    goals.reset()
+    g5 = goals.add_goal("t-e", "再来一次", "①", [])
+    age(g5, 999)
+    out = worker.resume_goals(graph=FakeGraph(finish="done"))
+    ok("通知抛异常仍算完成", out["done"] == 1, out)
+    ok("目标仍是 done", goals.get_goal(g5)["status"] == goals.STATUS_DONE)
+finally:
+    _sched.push_alert = _orig_push
+
 print(f"\n结果：{_passed} 通过，{_failed} 失败")
 sys.exit(1 if _failed else 0)

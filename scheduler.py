@@ -437,3 +437,21 @@ def pending_reminders_count() -> int:
         return int(n)
     except Exception:
         return -1
+
+
+def push_alert(content: str) -> int:
+    """直接写一条提醒弹窗（供 worker 在目标完成/放弃时用，不需要排期）。
+
+    和 create_reminder 的区别：这个不发"到点"提醒，只是往 alerts 里插一条，
+    界面下次渲染时出现在顶部提示条里。
+    """
+    conn = _db()
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO alerts (content, fired_at) VALUES (?,?)",
+            (content, datetime.now().strftime("%Y-%m-%d %H:%M")),
+        )
+        rid = cur.lastrowid
+    conn.close()
+    log.info("写入提醒弹窗 #%s：%s", rid, content[:60])
+    return int(rid)

@@ -92,9 +92,23 @@ def resume_goals(limit: int = 2, graph=None) -> dict:
         status = (goals.get_goal(gid) or {}).get("status")
         if status == goals.STATUS_DONE:
             out["done"] += 1
+            _notify_done(gid, text)
         elif status == goals.STATUS_ACTIVE:
             out["left"] += 1
     return out
+
+
+def _notify_done(gid: int, text: str) -> None:
+    """目标跑完写一条提醒弹窗 —— 用户不必盯着页面等结果。"""
+    g = goals.get_goal(gid) or {}
+    result = (g.get("result") or "").strip().replace("\n", " ")
+    head = f"✅ 目标完成｜{text[:40]}"
+    if result:
+        head += f"\n{result[:120]}"
+    try:
+        scheduler.push_alert(head)
+    except Exception as e:  # noqa: BLE001 - 通知失败不能影响续跑结果
+        log.warning("目标 #%d 完成，但写提醒失败：%r", gid, e)
 
 
 def main() -> int:
