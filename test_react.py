@@ -150,9 +150,13 @@ install(Script(executor=[AIMessage(content="CONTINUE: 先查站点再查车次")
 state["goal_id"] = gid3
 state["replans"] = 0
 out = main.executor_node(state, {"configurable": {"thread_id": "t-react"}})
-ok("CONTINUE 累加 replans", out["replans"] == 1, out["replans"])
-ok("CONTINUE 记到库里的 replans", goals.get_goal(gid3)["replans"] == 1,
-   goals.get_goal(gid3)["replans"])
+ok("CONTINUE → plan_status blocked", out["plan_status"] == "blocked", out["plan_status"])
+# 计数不在执行节点做（2026-11-20 改）：只有真回到规划节点才算一次重规划，
+# 否则模型声明 NEXT: critic 也会白吃一次 MAX_REPLAN。
+ok("CONTINUE 不自行增加 replans", out["replans"] == 0, out["replans"])
+ok("库里的 replans 也没动", goals.get_goal(gid3)["replans"] == 0, goals.get_goal(gid3)["replans"])
+ok("blocked 时路由会回规划", main._after_executor(
+    {"plan_status": "blocked", "next_hint": "", "replans": 0}) == "planner")
 
 # ---------------- 4. 整图：重规划回边 ----------------
 check("4. 整图：计划被推翻一次")
@@ -175,7 +179,7 @@ ok("最终结果含温度", "17℃" in (res.get("execution_result") or ""), res.
 ok("state 记录 replans=1", res.get("replans") == 1, res.get("replans"))
 all_goals = goals.list_goals(limit=10)
 ok("重规划复用同一条目标记录", len(all_goals) == 1, len(all_goals))
-ok("目标用的是第二版计划", all_goals[0]["plan"].startswith("①换个城市"), all_goals[0]["plan"])
+ok("目标用的是第二版计划", "换个城市" in all_goals[0]["plan"], all_goals[0]["plan"])
 ok("评审通过时目标置为 done", all_goals[0]["status"] == "done", all_goals[0]["status"])
 
 check("5. 整图：ASK 直接结束，不进评审")
@@ -203,6 +207,54 @@ res3 = main.build_graph(None).invoke({"messages": [HumanMessage(content="帮我�
 ok("没有进执行节点", not any("执行" in c for c in script.calls), script.calls)
 ok("反问文本正确", "要盯哪一天的票" in (res3.get("execution_result") or ""),
    res3.get("execution_result"))
+
+check("7. 步骤勾选 STEP 写回目标")
+goals.reset()
+main.bind_thread("t-steps")
+STEP_PLAN = ('{"steps": ["读合同条款", "把比例算成钱"], "checks": ["给出 5%"], '
+             '"need_input": ""}')
+install(Script(planner=[STEP_PLAN],
+               executor=[AIMessage(content="第 1 步看完了。\nSTEP: 1 done\nSTEP: 2 failed: 合同里没写金额\nNEXT: critic")],
+               critic=[PASS_JSON]))
+res4 = main.build_graph(None).invoke({"messages": [HumanMessage(content="算一下违约金")]})
+g4 = goals.list_goals(limit=1)[0]
+ok("规划出了两步", len(g4["steps"]) == 2, g4["steps"])
+ok("第 1 步标记 done", g4["steps"][0]["status"] == "done", g4["steps"])
+ok("第 2 步标记 failed 且带原因", g4["steps"][1]["status"] == "failed"
+   and "没写金额" in (g4["steps"][1].get("note") or ""), g4["steps"][1])
+ok("有失败步骤 → plan_status blocked", res4.get("plan_status") == "blocked", res4.get("plan_status"))
+ok("模型声明 NEXT: critic 时不重规划", res4.get("replans") == 0, res4.get("replans"))
+ok("规划只被调用一次", sum(1 for c in script.calls if "规划" in c) == 1, script.calls)
+ok("计划文本里能看到步骤状态", "✅" in g4["plan"] and "❌" in g4["plan"], g4["plan"])
+_ans = res4.get("execution_result") or ""
+ok("用户看到的回答里没有 STEP 控制行", "STEP:" not in _ans and "NEXT:" not in _ans, _ans)
+ok("回答正文被保留", "第 1 步看完了" in _ans, _ans)
+
+check("8. NEXT 由模型决定走向")
+ok("_after_executor 听 NEXT: replan",
+   main._after_executor({"plan_status": "ok", "next_hint": "replan", "replans": 0}) == "planner")
+ok("replan 次数用尽则不再回规划",
+   main._after_executor({"plan_status": "ok", "next_hint": "replan", "replans": 2}) == "critic")
+ok("_after_executor 听 NEXT: critic",
+   main._after_executor({"plan_status": "blocked", "next_hint": "critic", "replans": 0}) == "critic")
+ok("没有 NEXT 时按状态兜底（blocked → planner）",
+   main._after_executor({"plan_status": "blocked", "next_hint": "", "replans": 0}) == "planner")
+ok("ASK 永远直接结束",
+   main._after_executor({"plan_status": "ask", "next_hint": "replan", "replans": 0}) == "end")
+
+check("9. 整图：NEXT: replan 真的回到规划节点")
+goals.reset()
+main.bind_thread("t-next")
+script = Script(planner=[STEP_PLAN, STEP_PLAN],
+                executor=[AIMessage(content="这条计划不对，得先确认是哪份合同\nNEXT: replan"),
+                          AIMessage(content="算出来了，违约金 1 万元\nNEXT: critic")],
+                critic=[PASS_JSON])
+install(script)
+res5 = main.build_graph(None).invoke({"messages": [HumanMessage(content="算一下违约金")]})
+ok("规划节点被调用两次", sum(1 for c in script.calls if "规划" in c) == 2, script.calls)
+ok("最终状态 done", goals.list_goals(limit=1)[0]["status"] == "done",
+   goals.list_goals(limit=1)[0]["status"])
+ok("仍然是同一条目标记录", len(goals.list_goals(limit=10)) == 1, len(goals.list_goals(limit=10)))
 
 print(f"\n结果：{_passed} 通过，{_failed} 失败")
 sys.exit(1 if _failed else 0)

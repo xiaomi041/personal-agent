@@ -38,41 +38,69 @@ def check(name):
 
 # ---------------- 1. _parse_plan ----------------
 check("1. 规划输出解析")
-plan, checks, need = main._parse_plan(
+plan, checks, need, steps = main._parse_plan(
     '{"plan": "①查文档 ②总结", "checks": ["回答含违约金 5%", "给出了页码"], "need_input": ""}'
 )
-ok("正常 JSON：计划", plan == "①查文档 ②总结", plan)
+ok("单行编号计划被拆成两步", [s["text"] for s in steps] == ["查文档", "总结"], steps)
+ok("计划渲染成带勾选框的步骤表", plan.startswith("⬜ 1. 查文档"), plan)
 ok("正常 JSON：判据 2 条", checks == ["回答含违约金 5%", "给出了页码"], checks)
 ok("正常 JSON：无追问", need == "", need)
 
-plan, checks, need = main._parse_plan(
+plan, checks, need, steps = main._parse_plan(
+    '{"steps": ["读合同找违约金条款", "把比例算成钱"], "checks": ["给出 5%"], "need_input": ""}'
+)
+ok("steps 数组：两步", [s["text"] for s in steps] == ["读合同找违约金条款", "把比例算成钱"], steps)
+ok("steps 数组：初始状态都是 pending", all(s["status"] == "pending" for s in steps), steps)
+
+plan, checks, need, steps = main._parse_plan(
     '```json\n{"plan": "①查天气", "checks": ["给出温度"], "need_input": ""}\n```'
 )
-ok("带代码围栏也能解析", plan == "①查天气" and checks == ["给出温度"], (plan, checks))
+ok("带代码围栏也能解析", len(steps) == 1 and checks == ["给出温度"], (steps, checks))
 
-plan, checks, need = main._parse_plan(
+plan, checks, need, steps = main._parse_plan(
     '好的，我按下面执行：{"plan": "①列待办", "checks": ["列出待办条目"], "need_input": ""}'
 )
-ok("JSON 前有解释文字也能解析", plan == "①列待办", plan)
+ok("JSON 前有解释文字也能解析", len(steps) == 1 and plan.startswith("⬜ 1. 列待办"), (plan, steps))
 
-plan, checks, need = main._parse_plan(
+plan, checks, need, steps = main._parse_plan(
     '{"plan": "", "checks": [], "need_input": "要盯哪一天的票？"}'
 )
-ok("need_input 优先：计划为空", plan == "" and checks == [], (plan, checks))
+ok("need_input 优先：计划为空", plan == "" and checks == [] and steps == [], (plan, checks, steps))
 ok("need_input 取出问题", need == "要盯哪一天的票？", need)
 
-plan, checks, need = main._parse_plan("需要补充：请告诉我出发日期")
+plan, checks, need, steps = main._parse_plan("需要补充：请告诉我出发日期")
 ok("老格式「需要补充」仍可用", need == "请告诉我出发日期", need)
 
-plan, checks, need = main._parse_plan("计划：①先查日期 ②再查天气")
-ok("纯文本计划兜底", plan.startswith("计划：") and checks == [] and need == "", (plan, checks, need))
+plan, checks, need, steps = main._parse_plan("计划：①先查日期 ②再查天气")
+ok("纯文本计划兜底（不强拆步骤）",
+   plan.startswith("计划：") and checks == [] and need == "" and steps == [], (plan, checks, need, steps))
 
-plan, checks, need = main._parse_plan(
+plan, checks, need, steps = main._parse_plan(
     json.dumps({"plan": "x", "checks": ["a", "b", "c", "d", "e"], "need_input": ""})
 )
 ok("判据最多保留 3 条", len(checks) == 3, checks)
+ok("不编号的字符串不硬拆成步骤", steps == [] and plan == "x", (plan, steps))
 
 ok("空输入不炸", main._parse_plan("")[0] == "")
+
+check("1b. 步骤工具函数")
+_st = main._norm_steps(["  1. 读文档  ", "", "②算钱"])
+ok("步骤编号连续、清掉前缀", [s["n"] for s in _st] == [1, 2] and _st[1]["text"] == "算钱", _st)
+ok("步骤最多 8 条", len(main._norm_steps([f"步骤{i}" for i in range(20)])) == 8, None)
+_marks = main._step_marks("先查一下\nSTEP: 2 done\nSTEP: 3 failed: 文件名不对\nSTEP: 4 skipped")
+ok("勾选解析出三条", [(n, s) for n, s, _ in _marks] == [(2, "done"), (3, "failed"), (4, "skipped")], _marks)
+ok("失败原因被带上", _marks[1][2] == "文件名不对", _marks[1])
+ok("句中的 STEP 不算（必须行首）",
+   main._step_marks("我把 STEP: 1 done 写在了句子中间") == [], None)
+_m2, bad = main._apply_marks(
+    [{"n": 1, "text": "a", "status": "pending"}, {"n": 2, "text": "b", "status": "pending"}],
+    [(1, "done", ""), (2, "failed", "超时")])
+ok("勾选写回状态", [s["status"] for s in _m2] == ["done", "failed"], _m2)
+ok("有失败步骤会被识别", bad is True, bad)
+ok("越界编号忽略", main._apply_marks([{"n": 1, "text": "a", "status": "pending"}], [(9, "done", "")])[0][0]["status"] == "pending", None)
+ok("NEXT 解析 critic", main._next_hint("做完了\nNEXT: critic") == "critic", None)
+ok("NEXT 解析 replan", main._next_hint("计划有问题\nnext：replan") == "replan", None)
+ok("NEXT 缺失返回空", main._next_hint("做完了，没有声明") == "", None)
 
 # ---------------- 2. _parse_review ----------------
 check("2. 评审输出解析")
@@ -135,9 +163,9 @@ check("4. 路由")
 ok("ask → end", main._after_executor({"plan_status": "ask"}) == "end")
 ok("abort → end", main._after_executor({"plan_status": "abort"}) == "end")
 ok("blocked 且未超上限 → planner",
-   main._after_executor({"plan_status": "blocked", "replans": 1}) == "planner")
-ok("blocked 且已超上限 → critic",
-   main._after_executor({"plan_status": "blocked", "replans": 2}) == "critic")
+   main._after_executor({"plan_status": "blocked", "replans": 0}) == "planner")
+ok("blocked 且已用掉重规划 → critic",
+   main._after_executor({"plan_status": "blocked", "replans": 1}) == "critic")
 ok("未完成阶段默认 → critic", main._after_executor({}) == "critic")
 ok("规划 need_input → end", main._plan_router({"plan": "需要补充：x"}) == "end")
 ok("规划 ask 状态 → end", main._plan_router({"plan": "x", "plan_status": "ask"}) == "end")

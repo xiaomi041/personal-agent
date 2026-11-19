@@ -76,20 +76,148 @@ class State(TypedDict):
     resume: bool  # 由 worker 自动续跑（而不是用户新发起）
     retry_hint: str  # 失败后换策略的提示（由 recovery 决定）
     last_error: str  # 上一次失败原因
+    steps: list  # 结构化步骤表 [{n,text,status}]
+    next_hint: str  # 执行节点声明的下一步走向（critic / replan / done）
 
 # 一次委托最多被推翻重规划几次。给 1 是因为"再规划一次还不行"通常说明任务本身有问题，
 # 继续重试只会烧钱；需要人工介入的信号应当通过 ASK 抛给用户。
 MAX_REPLAN = int(os.getenv("AGENT_MAX_REPLAN", "1"))
 
 _SIGNAL_RE = re.compile(r"^\s*(ASK|ABORT|CONTINUE)\s*[:：]\s*(.*)$", re.S | re.IGNORECASE | re.MULTILINE)
+# 步骤勾选：`STEP: 2 done` / `STEP: 3 failed: 文件名不对` / `STEP: 1 skipped`
+_STEP_RE = re.compile(
+    r"^[ \t]*STEP[ \t]*[:：][ \t]*(\d+)[ \t]*[·.\-—]?[ \t]*"
+    r"(done|ok|完成|failed|fail|失败|skip|skipped|跳过)[ \t]*[:：]?[ \t]*([^\n]*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+# 走向声明：`NEXT: critic | replan | done` —— 让模型决定下一步去哪，而不是只有固定边
+_NEXT_RE = re.compile(r"^\s*NEXT\s*[:：]\s*(critic|replan|done)\b", re.IGNORECASE | re.MULTILINE)
+
+_STEP_STATUS = {
+    "done": "done", "ok": "done", "完成": "done",
+    "failed": "failed", "fail": "failed", "失败": "failed",
+    "skip": "skipped", "skipped": "skipped", "跳过": "skipped",
+}
 
 
-def _parse_plan(text: str) -> tuple[str, list, str]:
-    """解析规划节点输出 → (plan, checks, need_input)。
+_CIRCLED = "①②③④⑤⑥⑦⑧⑨⑩"
+
+
+def _has_numbering(text: str) -> bool:
+    """这句计划本身带编号吗（① / 1. / 1、）？用来判断该不该当步骤表。"""
+    s = (text or "").strip()
+    if not s:
+        return False
+    if s[0] in _CIRCLED:
+        return True
+    return bool(re.match(r"^\d+\s*[.、)）]", s))
+
+
+def _split_numbered(text: str) -> list:
+    """把「①查文档 ②再总结」这类单行编号计划拆成步骤；拆不出来返回空。"""
+    s = (text or "").strip()
+    if not s:
+        return []
+    hits = [i for i, ch in enumerate(s) if ch in _CIRCLED]
+    if len(hits) >= 2 and hits[0] == 0:
+        parts = []
+        for idx, pos in enumerate(hits):
+            end = hits[idx + 1] if idx + 1 < len(hits) else len(s)
+            parts.append(s[pos + 1:end].strip())
+        return [p for p in parts if p]
+    lines = [ln.strip() for ln in s.replace("\r", "").split("\n") if ln.strip()]
+    return lines if len(lines) >= 2 else []
+
+
+def _norm_steps(raw) -> list:
+    """把模型给的步骤（字符串数组 / 对象数组 / 单行编号文本）规整成 [{n,text,status}]。"""
+    out = []
+    if isinstance(raw, str):
+        raw = _split_numbered(raw) or [raw]
+    for item in (raw or []):
+        if isinstance(item, dict):
+            text = str(item.get("step") or item.get("text") or "").strip()
+            status = str(item.get("status") or "pending").strip().lower()
+        else:
+            text, status = str(item).strip(), "pending"
+        text = re.sub(r"^\s*[①②③④⑤⑥⑦⑧⑨⑩\d]+[.、)）:：]?\s*", "", text).strip()
+        if not text:
+            continue
+        out.append({"n": len(out) + 1, "text": text[:200],
+                    "status": status if status in ("pending", "running", "done", "failed", "skipped") else "pending"})
+    return out[:8]
+
+
+def _render_plan(steps: list, fallback: str = "") -> str:
+    """步骤表 → 给 prompt/界面看的编号文本。"""
+    if not steps:
+        return fallback
+    mark = {"done": "✅", "failed": "❌", "running": "▶️", "skipped": "⏭", "pending": "⬜"}
+    return "\n".join(f"{mark.get(s['status'], '⬜')} {s['n']}. {s['text']}" for s in steps)
+
+
+def _step_marks(text: str) -> list:
+    """读模型写的步骤勾选 → [(n, status, note)]。多行、多次出现都认。"""
+    out = []
+    for m in _STEP_RE.finditer(text or ""):
+        try:
+            n = int(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        status = _STEP_STATUS.get(m.group(2).strip().lower(), "")
+        if not status:
+            continue
+        out.append((n, status, (m.group(3) or "").strip()[:120]))
+    return out
+
+
+def _apply_marks(steps: list, marks: list) -> tuple:
+    """把勾选应用到步骤表 → (新步骤表, 是否出现失败步骤)。"""
+    if not steps or not marks:
+        return steps, any(s.get("status") == "failed" for s in (steps or []))
+    fresh = [dict(s) for s in steps]
+    index = {int(s["n"]): s for s in fresh}
+    for n, status, note in marks:
+        s = index.get(n)
+        if not s:
+            continue
+        s["status"] = status
+        if note:
+            s["note"] = note
+    return fresh, any(s["status"] == "failed" for s in fresh)
+
+
+def _next_hint(text: str) -> str:
+    """读模型声明的下一步走向 → critic / replan / done / ""。"""
+    m = _NEXT_RE.search(text or "")
+    return m.group(1).lower() if m else ""
+
+
+_SIGNAL_LINE_RE = re.compile(
+    r"^[ \t]*(STEP[ \t]*[:：].*|NEXT[ \t]*[:：].*|(ASK|ABORT|CONTINUE)[ \t]*[:：].*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_signals(text: str) -> str:
+    """把 STEP / NEXT / ASK / ABORT / CONTINUE 这些控制行从给用户看的文本里去掉。
+
+    这些是节点之间沟通用的协议，漏在回答里就成了噪音（实测 eval 的端到端
+    输出里出现过 "STEP: 1 done STEP: 2 done" 混在答案前面）。
+    """
+    if not text:
+        return ""
+    body = _SIGNAL_LINE_RE.sub("", text)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    return body.strip()
+
+
+def _parse_plan(text: str) -> tuple[str, list, str, list]:
+    """解析规划节点输出 → (plan, checks, need_input, steps)。
 
     优先按 JSON 解析（新约定）；模型偶尔会带 ```json 围栏或加一句解释，
     这里做尽力而为的提取；解析不出来就退回老格式（"计划：…" / "需要补充：…"），
-    保证模型不听话时整条委托还能走完，只是没有 checks。
+    保证模型不听话时整条委托还能走完，只是没有 checks / steps。
     """
     raw = (text or "").strip()
     body = raw
@@ -102,20 +230,30 @@ def _parse_plan(text: str) -> tuple[str, list, str]:
     try:
         data = json.loads(body)
         if isinstance(data, dict):
-            plan = str(data.get("plan") or "").strip()
-            checks = [str(c).strip() for c in (data.get("checks") or []) if str(c).strip()]
+            # plan 可能是字符串（旧）也可能是步骤数组（新）
+            raw_plan = data.get("steps") if data.get("steps") is not None else data.get("plan")
             need = str(data.get("need_input") or "").strip()
             if need:
-                return plan, [], need
-            if plan:
-                return plan, checks[:3], ""
+                return "", [], need, []
+            if isinstance(raw_plan, (list, tuple)):
+                steps = _norm_steps(raw_plan)
+                checks = [str(c).strip() for c in (data.get("checks") or []) if str(c).strip()]
+                if steps:
+                    return _render_plan(steps), checks[:3], "", steps
+            elif isinstance(raw_plan, str) and raw_plan.strip():
+                checks = [str(c).strip() for c in (data.get("checks") or []) if str(c).strip()]
+                # 只有明确带编号（①…/1. …/多行）时才当步骤表，否则原样保留这句计划
+                if _split_numbered(raw_plan) or _has_numbering(raw_plan):
+                    steps = _norm_steps(raw_plan)
+                    return _render_plan(steps, fallback=raw_plan.strip()), checks[:3], "", steps
+                return raw_plan.strip(), checks[:3], "", []
     except (ValueError, TypeError):
         pass
     # 退回老格式
     if raw.startswith("需要补充") or "需要补充：" in raw[:12]:
         question = raw.split("：", 1)[-1].strip() if "：" in raw else raw
-        return "", [], question
-    return raw, [], ""
+        return "", [], question, []
+    return raw, [], "", []
 
 
 def _last_user_task(state) -> str:
@@ -152,13 +290,16 @@ def _build_context(state) -> str:
     return "\n".join(lines)
 
 PLANNER_PROMPT = SystemMessage(
-    "你是任务规划师。把用户委托拆成 1-3 步可执行计划，并给出 1-3 条「可判定的完成判据」。"
+    "你是任务规划师。把用户委托拆成 1-4 步可执行计划（每步是一件能独立做完的事），"
+    "并给出 1-3 条「可判定的完成判据」。"
     "只输出一个 JSON 对象，不要代码块围栏、不要解释："
-    '{"plan": "①... ②...", "checks": ["判据1", "判据2"], "need_input": ""}。'
+    '{"steps": ["读文档并找出违约金条款", "把比例和金额算清楚"], '
+    '"checks": ["判据1", "判据2"], "need_input": ""}。'
+    "steps 每条以动词开头、写成「做完什么样」的一句话，不要合并成一大段；"
     "checks 必须能凭执行结果与工具证据链直接判定真假，例如「回答里给出了违约金比例 5%」"
     "「output.md 已生成」「待办列表新增 1 条」；不要写「用户满意」「答案质量好」这类判不了的判据。"
     "只有在任务缺少「无法从工具或上下文获得」的关键参数时，才把 need_input 填成一句具体问题，"
-    "plan 与 checks 留空，例如 {\"plan\": \"\", \"checks\": [], \"need_input\": \"要盯哪一天的票？\"}。"
+    "steps 与 checks 留空，例如 {\"steps\": [], \"checks\": [], \"need_input\": \"要盯哪一天的票？\"}。"
     "以下情况一律不要追问，直接给计划：时间和日期（有 get_today 工具）、天气（可查默认城市）、"
     "待办/计划/文档列表（有对应工具）、用户已经在上面说过的信息。"
     "但「新增」类委托例外：只说「给我加个待办」「帮我设个提醒」却没给内容或时间时，"
@@ -206,11 +347,27 @@ def planner_node(state: State, config: RunnableConfig | None = None):
         )
     prompt = (
         f"对话历史：\n{context}\n\n{_docs_hint(_thread_from_config(config))}"
-        f"{resume_note}{retry_note}\n\n当前任务：{user_task}"
+        f"{resume_note}{retry_note}"
     )
+    # 重规划时把"哪些步骤已经做完"告诉模型：只重排剩下的，已经完成的不要再来一遍
+    prev_steps = []
+    gid_in = int(state.get("goal_id") or 0)
+    if gid_in:
+        prev = goals.get_goal(gid_in)
+        if prev:
+            prev_steps = list(prev.get("steps") or [])
+    if prev_steps:
+        done = [s for s in prev_steps if s.get("status") == "done"]
+        rest = [s for s in prev_steps if s.get("status") != "done"]
+        prompt += (
+            "\n\n这条委托已有计划，请只重新规划「未完成」的部分（不要重复已完成的步骤）：\n"
+            f"已完成：{_render_plan(done) or '（无）'}\n"
+            f"未完成：{_render_plan(rest) or '（无）'}"
+        )
+    prompt += f"\n\n当前任务：{user_task}"
     resp = call_llm(deepseek_model(), [PLANNER_PROMPT, HumanMessage(content=prompt)], what="规划节点")
     note_plan()
-    plan, checks, need = _parse_plan((resp.content or "").strip())
+    plan, checks, need, steps = _parse_plan((resp.content or "").strip())
 
     # 关键信息缺失 → 直接向用户澄清，不进入执行（避免瞎猜参数）
     if need:
@@ -220,6 +377,7 @@ def planner_node(state: State, config: RunnableConfig | None = None):
         return {
             "plan": f"需要补充：{need}",
             "checks": [],
+            "steps": [],
             "plan_status": "ask",
             "goal_id": gid,
             "replans": state.get("replans", 0),
@@ -239,16 +397,31 @@ def planner_node(state: State, config: RunnableConfig | None = None):
         bool(state.get("resume")) or prev.get("text") == user_task
     )
     if replanning:
-        goals.update_plan(gid, plan, checks)
-        replans = int(state.get("replans") or 0)
-        log.info("重规划完成（第 %d 次）：%s | 判据 %d 条", replans, _brief(plan, 120), len(checks))
+        # 保留已完成的步骤，新步骤接在后面：重规划只该动"还没做成的那部分"
+        kept = [s for s in (prev.get("steps") or []) if s.get("status") == "done"]
+        merged = _norm_steps([s["text"] for s in kept] + [s["text"] for s in steps]) if steps else kept
+        for i, s in enumerate(merged):
+            s["n"] = i + 1
+        if kept:
+            for s in merged[:len(kept)]:
+                s["status"] = "done"
+        plan = _render_plan(merged, fallback=plan)
+        goals.update_plan(gid, plan, checks, steps=merged)
+        # 计数放在这里而不是执行节点：只有"真的回去重规划了"才算一次重规划，
+        # 否则模型声明 NEXT: critic 却仍被计一次，MAX_REPLAN 会被莫名吃掉（踩过）。
+        replans = int(state.get("replans") or 0) + 1
+        goals.bump_replan(gid)
+        log.info("重规划完成（第 %d 次）：保留已完成 %d 步，新计划 %d 步 | 判据 %d 条",
+                 replans, len(kept), len(merged), len(checks))
+        steps = merged
     else:
-        gid = goals.add_goal(_thread_from_config(config), user_task, plan, checks)
+        gid = goals.add_goal(_thread_from_config(config), user_task, plan, checks, steps=steps)
         replans = 0
-        log.info("规划完成：%s | 判据 %d 条", _brief(plan, 120), len(checks))
+        log.info("规划完成：%d 步 %s | 判据 %d 条", len(steps), _brief(plan, 100), len(checks))
     return {
         "plan": plan,
         "checks": checks,
+        "steps": steps,
         "goal_id": gid,
         "replans": replans,
         "plan_status": "",
@@ -289,6 +462,11 @@ EXECUTOR_PROMPT = SystemMessage(
     "『ASK: <问题>』缺了只有用户本人才能提供的信息，必须先问人；"
     "『CONTINUE: <下一步>』还需要更多轮工具调用、但本轮已到上限，说明下一步准备做什么。"
     "正常完成任务时不要输出任何信号，直接用一两句话给出结果。"
+    "11. 计划是带编号的步骤表。每完成一步、或某一步确认失败时，必须单独成行写一行标记："
+    "『STEP: 2 done』『STEP: 3 failed: <为什么失败>』；跳过的写『STEP: 4 skipped』。"
+    "12. 收尾时用一行声明你希望下一步去哪：『NEXT: critic』（认为做完了，交评审核对）、"
+    "『NEXT: replan』（计划本身有问题，要重新规划）、『NEXT: done』（不需要评审，直接交付）。"
+    "不确定就写 NEXT: critic。"
 )
 
 def _signal(text: str) -> tuple[str, str]:
@@ -365,10 +543,13 @@ def executor_node(state: State, config=None):
             else ""
         )
         context = _build_context(state)
+        steps = list(state.get("steps") or [])
+        plan_view = _render_plan(steps, fallback=state.get("plan") or "")
         seed = [
             EXECUTOR_PROMPT,
             HumanMessage(
-                content=f"对话历史：\n{context}\n\n用户任务：{user_task}\n执行计划：{state['plan']}{review_note}"
+                content=f"对话历史：\n{context}\n\n用户任务：{user_task}\n执行计划（带编号，"
+                        f"做完一步就写 STEP 标记）：\n{plan_view}{review_note}"
             ),
         ]
         model = deepseek_model().bind_tools(TOOLS)
@@ -381,14 +562,34 @@ def executor_node(state: State, config=None):
             status, content = "abort", f"⛔ 这单做不到：{payload}"
         elif kind == "CONTINUE":
             status = "blocked"
-        shown = [m for m in messages if isinstance(m, (AIMessage, ToolMessage))]
+
+        # 步骤勾选可能散在任意一轮模型输出里（模型常常边调工具边写标记），全部扫一遍
+        marks = []
+        for m in messages:
+            if isinstance(m, AIMessage) and (m.content or ""):
+                marks.extend(_step_marks(m.content))
+        steps, has_failed = _apply_marks(steps, marks)
+        next_hint = _next_hint(content)
+        # 控制行不能漏给用户看：ASK/ABORT 已经换成专门文案，其余情况把 STEP/NEXT 行剥掉
+        if status in ("ok", "blocked") or not content.startswith(("🤔", "⛔")):
+            content = _strip_signals(content) or content
         gid = int(state.get("goal_id") or 0)
+        if marks:
+            log.info("步骤勾选 %d 条 | 失败步骤 %s | 下一步 %s",
+                     len(marks), "有" if has_failed else "无", next_hint or "（未声明）")
+            if gid:
+                goals.set_steps(gid, steps, plan_text=_render_plan(steps))
+        # 模型自己说某步失败了 → 和 CONTINUE 一样按"没做完"处理，交给路由器决定回不回规划
+        if has_failed and status in ("ok", ""):
+            status = "blocked"
+
+        shown = [m for m in messages if isinstance(m, (AIMessage, ToolMessage))]
         replans = int(state.get("replans") or 0)
         if status == "blocked":
-            # 没做完 → 允许回 planner 重规划一次；计数在 state 上，路由器据此判断是否还回
-            replans += 1
+            # 是否真回规划由 _after_executor 决定（看 NEXT 与 replans 上限）；
+            # 计数在 planner_node 重规划分支里 +1，这里不再动它。
             if gid:
-                goals.bump_replan(gid)
+                log.info("执行节点报告未完成，等待路由决定是否重规划")
         elif status == "ask" and gid:
             goals.set_status(gid, goals.STATUS_ASKED, content)
         elif status == "abort" and gid:
@@ -399,6 +600,8 @@ def executor_node(state: State, config=None):
             "execution_result": content,
             "execution_trace": "\n".join(trace) if trace else "（本轮未调用工具，纯文本回答）",
             "plan_status": status,
+            "steps": steps,
+            "next_hint": next_hint,
             "replans": replans,
             "messages": shown,
         }
@@ -495,11 +698,25 @@ def _review_router(state: State) -> str:
 
 
 def _after_executor(state: State) -> str:
-    """执行节点收尾后的分流：提问/放弃 → 结束；没做完 → 回规划重来；正常 → 评审。"""
+    """执行节点收尾后的分流。
+
+    先看模型自己声明的走向（NEXT: critic / replan / done），
+    没有声明或声明不合法时才退回按状态判断——这样"下一步去哪"是模型的决定，
+    代码只负责把它的选择落到合法的节点上。
+    """
     status = state.get("plan_status") or "ok"
     if status in ("ask", "abort"):
         return "end"
-    if status == "blocked" and state.get("replans", 0) <= MAX_REPLAN:
+    hint = (state.get("next_hint") or "").lower()
+    can_replan = state.get("replans", 0) < MAX_REPLAN
+    if hint == "replan":
+        return "planner" if can_replan else "critic"
+    if hint == "done":
+        # 模型说不需要评审：仍然交给评审做最后一道核对，但它可以据此直达 END
+        return "critic"
+    if hint == "critic":
+        return "critic"
+    if status == "blocked" and can_replan:
         return "planner"
     return "critic"
 

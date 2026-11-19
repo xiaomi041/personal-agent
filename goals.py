@@ -66,6 +66,7 @@ def init() -> None:
                     claim_until REAL NOT NULL DEFAULT 0,
                     recovery   TEXT NOT NULL DEFAULT '[]',
                     last_error TEXT NOT NULL DEFAULT '',
+                    steps      TEXT NOT NULL DEFAULT '[]',
                     created_at REAL NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL DEFAULT 0
                 )
@@ -82,6 +83,8 @@ def init() -> None:
                 c.execute("ALTER TABLE goals ADD COLUMN recovery TEXT NOT NULL DEFAULT '[]'")
             if "last_error" not in cols:
                 c.execute("ALTER TABLE goals ADD COLUMN last_error TEXT NOT NULL DEFAULT ''")
+            if "steps" not in cols:
+                c.execute("ALTER TABLE goals ADD COLUMN steps TEXT NOT NULL DEFAULT '[]'")
             c.execute("CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status, id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_goals_thread ON goals(thread_id, id)")
 
@@ -98,21 +101,28 @@ def _row(r: sqlite3.Row | None) -> dict | None:
         d["recovery"] = json.loads(d.get("recovery") or "[]")
     except (TypeError, ValueError):
         d["recovery"] = []
+    try:
+        d["steps"] = json.loads(d.get("steps") or "[]")
+    except (TypeError, ValueError):
+        d["steps"] = []
     return d
 
 
-def add_goal(thread_id: str, text: str, plan: str = "", checks: list | None = None) -> int:
+def add_goal(thread_id: str, text: str, plan: str = "", checks: list | None = None,
+             steps: list | None = None) -> int:
     """新建一条目标，返回 id。checks 为空也允许（老行为：只靠评审结论）。"""
     init()
     now = time.time()
     with _lock:
         with _conn() as c:
             cur = c.execute(
-                "INSERT INTO goals(thread_id, text, plan, checks, status, created_at, updated_at)"
-                " VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO goals(thread_id, text, plan, checks, status, steps, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
                 (thread_id or "", text or "", plan or "",
                  json.dumps(list(checks or []), ensure_ascii=False),
-                 STATUS_ACTIVE, now, now),
+                 STATUS_ACTIVE,
+                 json.dumps(list(steps or []), ensure_ascii=False),
+                 now, now),
             )
             gid = int(cur.lastrowid)
     log.info("目标已创建 | #%d | %s | 判据 %d 条", gid, (text or "")[:40], len(checks or []))
@@ -141,15 +151,42 @@ def set_status(goal_id: int, status: str, result: str | None = None) -> None:
     log.info("目标状态 | #%d -> %s", int(goal_id), status)
 
 
-def update_plan(goal_id: int, plan: str, checks: list | None = None) -> None:
-    """重规划后替换计划与判据（目标本身不变，变的只是怎么做）。"""
+def update_plan(goal_id: int, plan: str, checks: list | None = None,
+                steps: list | None = None) -> None:
+    """重规划后替换计划与判据（目标本身不变，变的只是怎么做）。
+
+    steps 传 None 表示"不改步骤表"（老调用方保持原样），传 [] 才是清空。
+    """
     init()
     with _lock:
         with _conn() as c:
-            c.execute("UPDATE goals SET plan=?, checks=?, updated_at=? WHERE id=?",
-                      (plan or "", json.dumps(list(checks or []), ensure_ascii=False),
-                       time.time(), int(goal_id)))
-    log.info("目标重规划 | #%d | 判据 %d 条", int(goal_id), len(checks or []))
+            if steps is None:
+                c.execute("UPDATE goals SET plan=?, checks=?, updated_at=? WHERE id=?",
+                          (plan or "", json.dumps(list(checks or []), ensure_ascii=False),
+                           time.time(), int(goal_id)))
+            else:
+                c.execute("UPDATE goals SET plan=?, checks=?, steps=?, updated_at=? WHERE id=?",
+                          (plan or "", json.dumps(list(checks or []), ensure_ascii=False),
+                           json.dumps(list(steps), ensure_ascii=False), time.time(), int(goal_id)))
+    log.info("目标重规划 | #%d | 判据 %d 条 | 步骤 %d 个",
+             int(goal_id), len(checks or []), len(steps or []) if steps is not None else -1)
+
+
+def set_steps(goal_id: int, steps: list, plan_text: str | None = None) -> None:
+    """只更新步骤表（执行节点勾选/标记失败时用），不动计划文本与判据。
+
+    plan_text 传了就顺带把计划文本刷成最新渲染（界面读的是 plan 这一列）。
+    """
+    init()
+    with _lock:
+        with _conn() as c:
+            if plan_text is None:
+                c.execute("UPDATE goals SET steps=?, updated_at=? WHERE id=?",
+                          (json.dumps(list(steps), ensure_ascii=False), time.time(), int(goal_id)))
+            else:
+                c.execute("UPDATE goals SET steps=?, plan=?, updated_at=? WHERE id=?",
+                          (json.dumps(list(steps), ensure_ascii=False), plan_text or "",
+                           time.time(), int(goal_id)))
 
 
 def bump_replan(goal_id: int) -> int:

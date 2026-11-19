@@ -75,12 +75,18 @@ def asked_back(text: str) -> bool:
 
     任务已交付后追一句「需要我帮你新增一条吗？」是礼貌收尾，不是澄清——
     上一版用「含问号」判定，把这种收尾误判成反问（假阴性）。
+
+    第三版：拿「第一句是不是问句」判断，而不是整段。模型这次回的是
+    「🤔 提醒的内容和时间分别是什么？（例如：明天 9 点提醒我交实验报告）」，
+    整段里有数字（9 点）就被旧规则判成"已交付"，实际它是真追问。
     """
-    if text.strip().startswith("需要补充"):
+    t = (text or "").strip()
+    if t.startswith("🤔") or t.startswith("需要补充"):
         return True
-    if not has(text, "？", "?"):
+    if not has(t, "？", "?"):
         return False
-    return re.search(r"\d", text) is None
+    first = re.split(r"[。\n]", t)[0]
+    return has(first, "？", "?") and not re.search(r"\d", first)
 
 
 # ------------------------------------------------------------------ 任务定义
