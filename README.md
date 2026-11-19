@@ -150,6 +150,31 @@ python test_resume.py   # 27 条：续跑队列（含超限判失败、完成写
 | 8 路并发吞吐 | 1.89 req/s | 1.82 req/s |
 
 一句话：**成本没涨、正确率没掉、并发没退，代价是单请求慢 0.4 秒 + 多一份要维护的目标表**。
+
+### 同时推进多个目标（并发 + 认领）
+
+worker 一次不只推进一条目标，规则是**按会话分组、组间并行、组内串行**：
+
+| 情况 | 处理 | 原因 |
+|---|---|---|
+| 不同 `thread_id` 的目标 | 并行（上限 `GOAL_CONCURRENCY`，默认 3） | 各自一份 checkpoint，互不相干 |
+| 同一 `thread_id` 的目标 | 排队，按 id 升序依次跑 | 共用一份 checkpoint，并发会互相覆盖中间状态 |
+| 两个 worker 抢同一条 | `claim()` 原子认领 + 租约，抢不到就 `skip` | 查询到 ≠ 抢到，否则同一条会被跑两遍、白烧 token |
+| 跑完 / 抛异常 | `finally` 里 `release()` 放租约 | 否则租约到期前没人能再捡它 |
+
+实测（容器内真实模型，3 条「现在几点了」，`bench_goals.py`）：
+
+| 模式 | 墙钟 | 每条均摊 | 完成 |
+|---|---:|---:|---:|
+| `concurrency=1` | 13.11 s | 4.37 s | 3/3 |
+| `concurrency=3` | **4.42 s** | **1.47 s** | 3/3 |
+
+**2.97× 加速，理论上限 3×** —— 说明瓶颈就是"等模型"，而三条目标确实同时在等。
+
+```bash
+docker compose cp PersonalAI/bench_goals.py personal-ai:/app/bench_goals.py
+docker compose exec -T personal-ai python bench_goals.py
+```
 token 反而降了 9%，因为规划输出从一段散文变成了短 JSON。
 
 

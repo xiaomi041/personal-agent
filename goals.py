@@ -63,15 +63,19 @@ def init() -> None:
                     result     TEXT NOT NULL DEFAULT '',
                     replans    INTEGER NOT NULL DEFAULT 0,
                     attempts   INTEGER NOT NULL DEFAULT 0,
+                    claim_until REAL NOT NULL DEFAULT 0,
                     created_at REAL NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL DEFAULT 0
                 )
                 """
             )
-            # 老库没有 attempts 列（2026-11-20 之前建的），补上；重复 ALTER 会报错，用 PRAGMA 先查。
+            # 老库没有 attempts / claim_until 列（2026-11-20 之前建的），补上；
+            # 重复 ALTER 会报错，用 PRAGMA 先查。
             cols = {r["name"] for r in c.execute("PRAGMA table_info(goals)").fetchall()}
             if "attempts" not in cols:
                 c.execute("ALTER TABLE goals ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+            if "claim_until" not in cols:
+                c.execute("ALTER TABLE goals ADD COLUMN claim_until REAL NOT NULL DEFAULT 0")
             c.execute("CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status, id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_goals_thread ON goals(thread_id, id)")
 
@@ -178,21 +182,51 @@ def pending(limit: int = 5) -> list:
     return [_row(r) for r in rows]
 
 
-def stale(seconds: float, limit: int = 3) -> list:
+def stale(seconds: float, limit: int = 3, include_claimed: bool = False) -> list:
     """超过 `seconds` 秒没有任何更新的 active 目标 —— 判定为"停在半路"，可以续跑。
 
     这里是个近似判断：目标在执行过程中不会刷新 `updated_at`，所以长任务也会被捞出来。
-    能安全这么用，是因为 worker 里续跑是**单线程串行**的，不会自己踩自己；
-    如果没有这个前提，就得在开始执行时先打一个"正在跑"的标记。
+    多线程/多进程同时推进时还会互相抢同一条，所以真正认领要让 `claim()` 原子地抢；
+    这里默认把"已被别人认领且租约未到期"的目标排除掉。
     """
     init()
     cutoff = time.time() - max(1.0, float(seconds))
+    sql = "SELECT * FROM goals WHERE status=? AND updated_at<=?"
+    args = [STATUS_ACTIVE, cutoff]
+    if not include_claimed:
+        sql += " AND claim_until<=?"
+        args.append(time.time())
+    sql += " ORDER BY id ASC LIMIT ?"
+    args.append(int(limit))
     with _conn() as c:
-        rows = c.execute(
-            "SELECT * FROM goals WHERE status=? AND updated_at<=? ORDER BY id ASC LIMIT ?",
-            (STATUS_ACTIVE, cutoff, int(limit)),
-        ).fetchall()
+        rows = c.execute(sql, args).fetchall()
     return [_row(r) for r in rows]
+
+
+def claim(goal_id: int, lease: float = 180.0) -> bool:
+    """原子认领一条目标：只有"还没被认领 / 租约已过期"的才能抢到。
+
+    这是多线程推进的关键——`stale()` 只是查询，两个线程同时查到同一条会各跑一遍，
+    既浪费 token 也会互相覆盖结果。真正的互斥靠这条 UPDATE 的 WHERE 条件。
+    """
+    init()
+    now = time.time()
+    with _lock:
+        with _conn() as c:
+            cur = c.execute(
+                "UPDATE goals SET claim_until=? WHERE id=? AND status=? AND claim_until<=?",
+                (now + max(5.0, float(lease)), int(goal_id), STATUS_ACTIVE, now),
+            )
+            return cur.rowcount == 1
+
+
+def release(goal_id: int) -> None:
+    """放掉认领（跑完/失败都要放，否则租约到期前没人能再捡）。"""
+    init()
+    with _lock:
+        with _conn() as c:
+            c.execute("UPDATE goals SET claim_until=0 WHERE id=?", (int(goal_id),))
+
 
 
 def bump_attempt(goal_id: int) -> int:

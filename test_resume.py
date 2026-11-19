@@ -7,6 +7,7 @@
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -40,24 +41,36 @@ def check(name):
 class FakeGraph:
     """记录被调用时的 (text, thread)，并按预设决定目标最终状态。"""
 
-    def __init__(self, finish="done", boom=False):
+    def __init__(self, finish="done", boom=False, delay=0.0):
         self.finish = finish
         self.boom = boom
+        self.delay = delay
         self.calls = []
         self.states = []
+        self.spans = []
+        self._lock = threading.Lock()
 
     def invoke(self, state, config=None):
         text = state["messages"][0].content
         thread = (config or {}).get("configurable", {}).get("thread_id")
-        self.calls.append((text, thread, state.get("resume")))
-        self.states.append(state)
-        if self.boom:
-            raise RuntimeError("模型挂了")
-        # 用 state 里带的 goal_id 更接近真实行为（规划节点就是靠它复用记录）
-        gid = state.get("goal_id") or goals.list_goals(thread_id=thread, limit=1)[0]["id"]
-        if self.finish == "done":
-            goals.set_status(gid, goals.STATUS_DONE, "续跑完成")
-        return {"execution_result": "ok"}
+        started = time.perf_counter()
+        with self._lock:
+            self.calls.append((text, thread, state.get("resume")))
+            self.states.append(state)
+        try:
+            if self.delay:
+                time.sleep(self.delay)
+            if self.boom:
+                raise RuntimeError("模型挂了")
+            # 用 state 里带的 goal_id 更接近真实行为（规划节点就是靠它复用记录）
+            gid = state.get("goal_id") or goals.list_goals(thread_id=thread, limit=1)[0]["id"]
+            if self.finish == "done":
+                goals.set_status(gid, goals.STATUS_DONE, "续跑完成")
+            return {"execution_result": "ok"}
+        finally:
+            with self._lock:
+                self.spans.append((thread, started, time.perf_counter()))
+
 
 
 def age(goal_id, seconds):
@@ -136,7 +149,9 @@ ok("放弃原因写进 result", "续跑" in (goals.get_goal(g3)["result"] or "")
 check("5. 空队列")
 goals.reset()
 out = worker.resume_goals(graph=FakeGraph())
-ok("空队列 picked=0", out == {"picked": 0, "done": 0, "failed": 0, "left": 0}, out)
+ok("空队列 picked=0", out["picked"] == 0 and out["done"] == 0 and out["failed"] == 0
+   and out["left"] == 0, out)
+
 
 # ---------------- 6. 完成要写提醒弹窗 ----------------
 check("6. 目标完成写一条提醒（用户不必盯着页面）")
@@ -168,6 +183,72 @@ try:
     ok("目标仍是 done", goals.get_goal(g5)["status"] == goals.STATUS_DONE)
 finally:
     _sched.push_alert = _orig_push
+
+# ---------------- 7. 同时推进多个目标 ----------------
+check("7. 多目标并发推进")
+goals.reset()
+ids = []
+for i in range(3):
+    gid = goals.add_goal(f"t-par-{i}", f"任务{i}", "①", [])
+    age(gid, 999)
+    ids.append(gid)
+graph = FakeGraph(finish="done", delay=0.35)
+t0 = time.perf_counter()
+out = worker.resume_goals(limit=10, graph=graph, concurrency=3)
+elapsed = time.perf_counter() - t0
+ok("三条都完成", out["done"] == 3, out)
+ok("识别出 3 个会话", out["groups"] == 3, out)
+# 串行至少 1.05s，并行应接近 0.35s；留足余量避免 CI 抖动
+ok("并行确实更快（< 0.8s）", elapsed < 0.8, f"{elapsed:.3f}s")
+ok("三条各调一次", len(graph.calls) == 3, len(graph.calls))
+
+check("7b. 同一会话必须串行（共用 checkpoint）")
+goals.reset()
+same = [goals.add_goal("t-same", f"同会话任务{i}", "①", []) for i in range(2)]
+for gid in same:
+    age(gid, 999)
+graph = FakeGraph(finish="done", delay=0.25)
+t0 = time.perf_counter()
+out = worker.resume_goals(limit=10, graph=graph, concurrency=3)
+elapsed = time.perf_counter() - t0
+ok("同会话两条都完成", out["done"] == 2, out)
+ok("只算一个会话组", out["groups"] == 1, out)
+ok("串行耗时 ≥ 0.45s", elapsed >= 0.45, f"{elapsed:.3f}s")
+spans = sorted(graph.spans, key=lambda s: s[1])
+ok("两段执行不重叠", len(spans) == 2 and spans[1][1] >= spans[0][2] - 0.02, spans)
+
+check("7c. 并发度可被压到 1（退化成串行）")
+goals.reset()
+for i in range(3):
+    age(goals.add_goal(f"t-serial-{i}", f"串行{i}", "①", []), 999)
+graph = FakeGraph(finish="done", delay=0.2)
+t0 = time.perf_counter()
+out = worker.resume_goals(limit=10, graph=graph, concurrency=1)
+elapsed = time.perf_counter() - t0
+ok("三条都完成", out["done"] == 3, out)
+ok("concurrency=1 时 ≥ 0.55s", elapsed >= 0.55, f"{elapsed:.3f}s")
+
+check("7d. 认领互斥：查到 ≠ 抢到")
+goals.reset()
+gid = goals.add_goal("t-claim", "会被抢的目标", "①", [])
+age(gid, 999)
+ok("第一次认领成功", goals.claim(gid, 60) is True)
+ok("被别人认领后 stale 不再返回它",
+   all(g["id"] != gid for g in goals.stale(120, limit=10)))
+ok("第二次认领失败", goals.claim(gid, 60) is False)
+goals.release(gid)
+ok("释放后又能被认领", goals.claim(gid, 60) is True)
+goals.release(gid)
+
+check("7e. 已被认领的目标在续跑里只记 skip，不会重复跑")
+goals.reset()
+gid = goals.add_goal("t-skip", "别人正在跑的目标", "①", [])
+age(gid, 999)
+goals.claim(gid, 120)
+graph = FakeGraph(finish="done")
+out = worker.resume_goals(limit=10, graph=graph)
+ok("picked 里没有它", out["picked"] == 0, out)
+ok("graph 没被调用", graph.calls == [], graph.calls)
 
 print(f"\n结果：{_passed} 通过，{_failed} 失败")
 sys.exit(1 if _failed else 0)
