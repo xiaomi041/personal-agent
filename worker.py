@@ -75,7 +75,14 @@ def resume_goals(limit: int = 2, graph=None) -> dict:
             from langchain_core.messages import HumanMessage
 
             graph.invoke(
-                {"messages": [HumanMessage(content=text)], "resume": True},
+                {
+                    "messages": [HumanMessage(content=text)],
+                    "resume": True,
+                    # 带上 goal_id/checks：续跑必须写回**同一条**目标记录，
+                    # 否则规划节点会以为这是新委托、新建一条，原目标永远停在 active。
+                    "goal_id": gid,
+                    "checks": list(g.get("checks") or []),
+                },
                 config={"configurable": {"thread_id": g.get("thread_id") or "user-main"}},
             )
         except Exception as e:  # noqa: BLE001 - 单条目标失败不能拖垮整个 worker

@@ -44,14 +44,17 @@ class FakeGraph:
         self.finish = finish
         self.boom = boom
         self.calls = []
+        self.states = []
 
     def invoke(self, state, config=None):
         text = state["messages"][0].content
         thread = (config or {}).get("configurable", {}).get("thread_id")
         self.calls.append((text, thread, state.get("resume")))
+        self.states.append(state)
         if self.boom:
             raise RuntimeError("模型挂了")
-        gid = goals.list_goals(thread_id=thread, limit=1)[0]["id"]
+        # 用 state 里带的 goal_id 更接近真实行为（规划节点就是靠它复用记录）
+        gid = state.get("goal_id") or goals.list_goals(thread_id=thread, limit=1)[0]["id"]
         if self.finish == "done":
             goals.set_status(gid, goals.STATUS_DONE, "续跑完成")
         return {"execution_result": "ok"}
@@ -95,6 +98,9 @@ ok("graph 被调用一次", len(graph.calls) == 1, graph.calls)
 ok("续跑带上原委托文本", graph.calls[0][0] == "查明天北京天气", graph.calls)
 ok("续跑带原 thread", graph.calls[0][1] == "t-a", graph.calls)
 ok("续跑标记 resume=True", graph.calls[0][2] is True, graph.calls)
+# 回归：续跑必须带 goal_id 回写同一条记录，否则规划节点会新建目标、原目标永远 active
+ok("续跑带上原 goal_id", graph.states[0].get("goal_id") == g1, graph.states[0].get("goal_id"))
+ok("续跑带上原判据", graph.states[0].get("checks") == ["给出温度"], graph.states[0].get("checks"))
 ok("目标状态变 done", goals.get_goal(g1)["status"] == "done")
 ok("attempts 记 1 次", goals.get_goal(g1)["attempts"] == 1, goals.get_goal(g1)["attempts"])
 

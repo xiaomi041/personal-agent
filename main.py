@@ -220,11 +220,15 @@ def planner_node(state: State, config: RunnableConfig | None = None):
 
     if not plan:  # 模型给了 JSON 但 plan 为空、也没有 need_input：兜底成一句计划
         plan = "计划：按用户委托直接执行。"
-    # 重规划（同一条委托、同一轮内被推翻）复用原目标记录，只换计划；
-    # 否则说明是新一轮委托，新建目标。
+    # 复用原目标记录的两种情况：
+    #   ① 同一轮内计划被推翻（重规划）——同一条委托、状态仍 active；
+    #   ② worker 自动续跑——state 里带着 goal_id，必须接着写同一条记录，
+    #      否则每次续跑都会新建一个目标，原目标永远停在 active（踩过）。
     gid = int(state.get("goal_id") or 0)
     prev = goals.get_goal(gid) if gid else None
-    replanning = bool(prev) and prev.get("text") == user_task and prev.get("status") == goals.STATUS_ACTIVE
+    replanning = bool(prev) and prev.get("status") == goals.STATUS_ACTIVE and (
+        bool(state.get("resume")) or prev.get("text") == user_task
+    )
     if replanning:
         goals.update_plan(gid, plan, checks)
         replans = int(state.get("replans") or 0)
