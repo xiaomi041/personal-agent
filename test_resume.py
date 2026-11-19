@@ -128,22 +128,40 @@ ok("目标仍是 active（留给下次）", goals.get_goal(g2)["status"] == goal
    goals.get_goal(g2)["status"])
 ok("attempts 仍记了数", goals.get_goal(g2)["attempts"] == 1, goals.get_goal(g2)["attempts"])
 
-# ---------------- 4. 续跑次数封顶 ----------------
-check("4. 续跑超限就判失败，不再调 graph")
+# ---------------- 4. 续跑次数用尽 → 先换策略，不是判死 ----------------
+check("4. 续跑超限后换策略重试（不再直接判失败）")
 goals.reset()
 g3 = goals.add_goal("t-c", "总是跑不完的目标", "①", [])
+goals.note_error(g3, "模型输出格式不对")
 age(g3, 999)
 for _ in range(worker.GOAL_MAX_ATTEMPTS):
     goals.bump_attempt(g3)
 age(g3, 999)  # bump_attempt 会刷新 updated_at，重新拨旧
 graph = FakeGraph(finish="done")
 out = worker.resume_goals(graph=graph)
+ok("换策略后这一轮成了", out["done"] == 1, out)
+ok("graph 被调用一次（换策略后重试）", len(graph.calls) == 1, graph.calls)
+ok("带上换策略提示", "换" in (graph.states[0].get("retry_hint") or ""),
+   graph.states[0].get("retry_hint"))
+ok("换策略被记录", len(goals.get_goal(g3)["recovery"]) == 1, goals.get_goal(g3)["recovery"])
+
+check("4b. 策略用尽才判失败")
+goals.reset()
+g3b = goals.add_goal("t-c2", "怎么都做不成的目标", "①", [])
+goals.note_error(g3b, "随便什么原因")
+for s in ("replan", "narrow"):
+    goals.add_recovery(g3b, s, "")
+for _ in range(worker.GOAL_MAX_ATTEMPTS):
+    goals.bump_attempt(g3b)
+age(g3b, 999)
+graph = FakeGraph(finish="done")
+out = worker.resume_goals(graph=graph)
 ok("本次记为失败", out["failed"] == 1, out)
 ok("graph 没有被调用", graph.calls == [], graph.calls)
-ok("目标状态 aborted", goals.get_goal(g3)["status"] == goals.STATUS_ABORTED,
-   goals.get_goal(g3)["status"])
-ok("放弃原因写进 result", "续跑" in (goals.get_goal(g3)["result"] or ""),
-   goals.get_goal(g3)["result"])
+ok("目标状态 aborted", goals.get_goal(g3b)["status"] == goals.STATUS_ABORTED,
+   goals.get_goal(g3b)["status"])
+ok("放弃原因写进 result", "换策略仍没做成" in (goals.get_goal(g3b)["result"] or ""),
+   goals.get_goal(g3b)["result"])
 
 # ---------------- 5. 没有目标时不折腾 ----------------
 check("5. 空队列")

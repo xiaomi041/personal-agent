@@ -33,6 +33,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import goals
+import recovery
 import scheduler
 
 log = logging.getLogger("worker")
@@ -56,10 +57,61 @@ def _handle(signum, _frame):
     log.info("收到信号 %s，准备退出", signum)
 
 
+def _recover(gid: int, g: dict) -> "Recovery | None":
+    """续跑次数用尽时，按失败原因换一种策略。返回 None 表示到此为止。"""
+    last_error = g.get("last_error") or ""
+    tried = [r.get("strategy") for r in (g.get("recovery") or [])]
+    rec = recovery.pick(last_error, tried)
+    if rec.giveup:
+        how = recovery.summarize(tried)
+        goals.set_status(
+            gid, goals.STATUS_ABORTED,
+            f"换策略仍没做成（已试：{how or '无'}）。最后一次失败：{(last_error or '原因不明')[:160]}",
+        )
+        log.warning("目标 #%d 策略用尽，判失败：%s", gid, rec.reason)
+        return None
+    goals.add_recovery(gid, rec.strategy, rec.hint)
+    goals.reset_attempts(gid)
+    log.info("目标 #%d 换策略 → %s：%s", gid, rec.strategy, rec.hint[:60])
+    return rec
+
+
+def _attempt(g: dict, graph, extra: dict) -> str:
+    """真正跑一次（带回写状态）。返回 done / failed / left。"""
+    gid = int(g["id"])
+    text = g.get("text") or ""
+    try:
+        from langchain_core.messages import HumanMessage
+
+        state = {
+            "messages": [HumanMessage(content=text)],
+            "resume": True,
+            # 带上 goal_id/checks：续跑必须写回**同一条**目标记录，
+            # 否则规划节点会以为这是新委托、新建一条，原目标永远停在 active。
+            "goal_id": gid,
+            "checks": list(g.get("checks") or []),
+        }
+        state.update(extra or {})
+        graph.invoke(
+            state,
+            config={"configurable": {"thread_id": g.get("thread_id") or "user-main"}},
+        )
+    except Exception as e:  # noqa: BLE001 - 单条目标失败不能拖垮整个 worker
+        log.exception("目标 #%d 续跑出错：%s", gid, str(e)[:160])
+        goals.note_error(gid, f"{type(e).__name__}: {str(e)[:200]}")
+        return "failed"
+    status = (goals.get_goal(gid) or {}).get("status")
+    if status == goals.STATUS_DONE:
+        _notify_done(gid, text)
+        return "done"
+    return "left"
+
+
 def _run_one(g: dict, graph) -> str:
     """推进单条目标。返回 done / failed / left / skip。
 
     先 `claim()` 原子认领——查询到目标不等于抢到了目标，并发扫描时这一步才是互斥点。
+    续跑次数用尽后不直接判死：按 `recovery.pick()` 换一种策略，同一轮里立刻再跑一次。
     """
     gid = int(g["id"])
     if not goals.claim(gid, GOAL_LEASE):
@@ -68,36 +120,16 @@ def _run_one(g: dict, graph) -> str:
     try:
         tries = goals.bump_attempt(gid)
         if tries > GOAL_MAX_ATTEMPTS:
-            goals.set_status(gid, goals.STATUS_ABORTED,
-                             f"断续续跑 {tries - 1} 次仍未完成，已放弃，请人工看一下。")
-            log.warning("目标 #%d 续跑次数超限，判失败", gid)
-            return "failed"
-        text = g.get("text") or ""
+            rec = _recover(gid, goals.get_goal(gid) or g)
+            if rec is None:
+                return "failed"
+            log.info("目标 #%d（第 %d 次续跑已用尽，换策略后重试）：%s",
+                     gid, tries, (g.get("text") or "")[:40])
+            return _attempt(goals.get_goal(gid) or g, graph,
+                            recovery.retry_state(rec, (g.get("last_error") or "")))
         log.info("续跑目标 #%d（第 %d 次，会话 %s）：%s",
-                 gid, tries, g.get("thread_id") or "user-main", text[:40])
-        from langchain_core.messages import HumanMessage
-
-        graph.invoke(
-            {
-                "messages": [HumanMessage(content=text)],
-                "resume": True,
-                # 带上 goal_id/checks：续跑必须写回**同一条**目标记录，
-                # 否则规划节点会以为这是新委托、新建一条，原目标永远停在 active。
-                "goal_id": gid,
-                "checks": list(g.get("checks") or []),
-            },
-            config={"configurable": {"thread_id": g.get("thread_id") or "user-main"}},
-        )
-        status = (goals.get_goal(gid) or {}).get("status")
-        if status == goals.STATUS_DONE:
-            _notify_done(gid, text)
-            return "done"
-        if status == goals.STATUS_ACTIVE:
-            return "left"
-        return "left"
-    except Exception as e:  # noqa: BLE001 - 单条目标失败不能拖垮整个 worker
-        log.exception("目标 #%d 续跑出错：%s", gid, str(e)[:160])
-        return "failed"
+                 gid, tries, g.get("thread_id") or "user-main", (g.get("text") or "")[:40])
+        return _attempt(g, graph, {})
     finally:
         goals.release(gid)
 

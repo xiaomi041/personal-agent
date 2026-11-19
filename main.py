@@ -74,12 +74,14 @@ class State(TypedDict):
     replans: int  # 计划被推翻并重规划的次数（上限 1）
     goal_id: int  # 目标记录 id（goals 表）
     resume: bool  # 由 worker 自动续跑（而不是用户新发起）
+    retry_hint: str  # 失败后换策略的提示（由 recovery 决定）
+    last_error: str  # 上一次失败原因
 
 # 一次委托最多被推翻重规划几次。给 1 是因为"再规划一次还不行"通常说明任务本身有问题，
 # 继续重试只会烧钱；需要人工介入的信号应当通过 ASK 抛给用户。
 MAX_REPLAN = int(os.getenv("AGENT_MAX_REPLAN", "1"))
 
-_SIGNAL_RE = re.compile(r"^\s*(ASK|ABORT|CONTINUE)\s*[:：]\s*(.*)$", re.S | re.IGNORECASE)
+_SIGNAL_RE = re.compile(r"^\s*(ASK|ABORT|CONTINUE)\s*[:：]\s*(.*)$", re.S | re.IGNORECASE | re.MULTILINE)
 
 
 def _parse_plan(text: str) -> tuple[str, list, str]:
@@ -195,9 +197,16 @@ def planner_node(state: State, config: RunnableConfig | None = None):
         if state.get("resume")
         else ""
     )
+    retry_note = ""
+    if state.get("retry_hint"):
+        retry_note = (
+            f"\n⚠ 这条委托上次失败了（原因：{state.get('last_error') or '未说明'}）。"
+            f"这次必须换一种做法：{state.get('retry_hint')}。"
+            "不要重复上次失败的步骤。"
+        )
     prompt = (
         f"对话历史：\n{context}\n\n{_docs_hint(_thread_from_config(config))}"
-        f"{resume_note}\n\n当前任务：{user_task}"
+        f"{resume_note}{retry_note}\n\n当前任务：{user_task}"
     )
     resp = call_llm(deepseek_model(), [PLANNER_PROMPT, HumanMessage(content=prompt)], what="规划节点")
     note_plan()
@@ -286,8 +295,10 @@ def _signal(text: str) -> tuple[str, str]:
     """从模型输出里读终态信号 → (kind, payload)。kind ∈ {"", "ASK", "ABORT", "CONTINUE"}。
 
     只认**行首**信号：模型复述规则或引用用户原话时，同样的词出现在句中不算数。
+    用 search 而不是 match：模型经常先解释一段、再另起一行写 `ASK: …`，
+    用 match 会漏掉（实测踩过：回答里明明问了用户，却被当成正常完成）。
     """
-    m = _SIGNAL_RE.match(text or "")
+    m = _SIGNAL_RE.search(text or "")
     if not m:
         return "", ""
     return m.group(1).upper(), (m.group(2) or "").strip()
@@ -381,7 +392,9 @@ def executor_node(state: State, config=None):
         elif status == "ask" and gid:
             goals.set_status(gid, goals.STATUS_ASKED, content)
         elif status == "abort" and gid:
-            goals.set_status(gid, goals.STATUS_ABORTED, content)
+            # 不再直接判死：记下原因、把目标留在 active，worker 会按 recovery 表换一种策略重试。
+            # 只有策略用尽仍不成时才真 aborted（见 recovery.pick / worker._run_one）。
+            goals.note_error(gid, content)
         return {
             "execution_result": content,
             "execution_trace": "\n".join(trace) if trace else "（本轮未调用工具，纯文本回答）",

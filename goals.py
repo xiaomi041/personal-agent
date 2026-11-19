@@ -64,18 +64,24 @@ def init() -> None:
                     replans    INTEGER NOT NULL DEFAULT 0,
                     attempts   INTEGER NOT NULL DEFAULT 0,
                     claim_until REAL NOT NULL DEFAULT 0,
+                    recovery   TEXT NOT NULL DEFAULT '[]',
+                    last_error TEXT NOT NULL DEFAULT '',
                     created_at REAL NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL DEFAULT 0
                 )
                 """
             )
-            # 老库没有 attempts / claim_until 列（2026-11-20 之前建的），补上；
+            # 老库没有 attempts / claim_until / recovery / last_error 列（旧版本建的），补上；
             # 重复 ALTER 会报错，用 PRAGMA 先查。
             cols = {r["name"] for r in c.execute("PRAGMA table_info(goals)").fetchall()}
             if "attempts" not in cols:
                 c.execute("ALTER TABLE goals ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
             if "claim_until" not in cols:
                 c.execute("ALTER TABLE goals ADD COLUMN claim_until REAL NOT NULL DEFAULT 0")
+            if "recovery" not in cols:
+                c.execute("ALTER TABLE goals ADD COLUMN recovery TEXT NOT NULL DEFAULT '[]'")
+            if "last_error" not in cols:
+                c.execute("ALTER TABLE goals ADD COLUMN last_error TEXT NOT NULL DEFAULT ''")
             c.execute("CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status, id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_goals_thread ON goals(thread_id, id)")
 
@@ -88,6 +94,10 @@ def _row(r: sqlite3.Row | None) -> dict | None:
         d["checks"] = json.loads(d.get("checks") or "[]")
     except (TypeError, ValueError):
         d["checks"] = []
+    try:
+        d["recovery"] = json.loads(d.get("recovery") or "[]")
+    except (TypeError, ValueError):
+        d["recovery"] = []
     return d
 
 
@@ -238,6 +248,47 @@ def bump_attempt(goal_id: int) -> int:
                       (time.time(), int(goal_id)))
             row = c.execute("SELECT attempts FROM goals WHERE id=?", (int(goal_id),)).fetchone()
     return int(row["attempts"]) if row else 0
+
+
+def reset_attempts(goal_id: int) -> None:
+    """换策略后重新给续跑次数：策略变了，旧的失败计数不该继续压着它。"""
+    init()
+    with _lock:
+        with _conn() as c:
+            c.execute("UPDATE goals SET attempts=0, updated_at=? WHERE id=?",
+                      (time.time(), int(goal_id)))
+
+
+def note_error(goal_id: int, message: str) -> None:
+    """记下最近一次失败原因，供 recovery.pick() 归因。"""
+    init()
+    with _lock:
+        with _conn() as c:
+            c.execute("UPDATE goals SET last_error=?, updated_at=? WHERE id=?",
+                      ((message or "")[:400], time.time(), int(goal_id)))
+
+
+def add_recovery(goal_id: int, strategy: str, hint: str = "") -> int:
+    """追加一条"换过的策略"记录，返回累计次数。"""
+    init()
+    with _lock:
+        with _conn() as c:
+            row = c.execute("SELECT recovery FROM goals WHERE id=?", (int(goal_id),)).fetchone()
+            try:
+                items = json.loads((row["recovery"] if row else "[]") or "[]")
+            except (TypeError, ValueError):
+                items = []
+            items.append({"strategy": strategy, "hint": hint, "at": time.time()})
+            c.execute("UPDATE goals SET recovery=?, updated_at=? WHERE id=?",
+                      (json.dumps(items, ensure_ascii=False), time.time(), int(goal_id)))
+    log.info("目标换策略 | #%d | %s", int(goal_id), strategy)
+    return len(items)
+
+
+def recoveries(goal_id: int) -> list:
+    """读回换策略轨迹（按时间顺序的策略名列表不够用时，用这个拿全量）。"""
+    g = get_goal(goal_id) or {}
+    return list(g.get("recovery") or [])
 
 
 def stats(days: int = 7) -> dict:

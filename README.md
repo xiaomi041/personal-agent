@@ -150,6 +150,7 @@ python test_resume.py   # 27 条：续跑队列（含超限判失败、完成写
 | 8 路并发吞吐 | 1.89 req/s | 1.82 req/s |
 
 一句话：**成本没涨、正确率没掉、并发没退，代价是单请求慢 0.4 秒 + 多一份要维护的目标表**。
+token 反而降了 9%，因为规划输出从一段散文变成了短 JSON。
 
 ### 同时推进多个目标（并发 + 认领）
 
@@ -175,7 +176,41 @@ worker 一次不只推进一条目标，规则是**按会话分组、组间并�
 docker compose cp PersonalAI/bench_goals.py personal-ai:/app/bench_goals.py
 docker compose exec -T personal-ai python bench_goals.py
 ```
-token 反而降了 9%，因为规划输出从一段散文变成了短 JSON。
+
+### 失败之后：换一种做法，而不是直接判死
+
+模型说 `ABORT`、或续跑次数用尽，**不再等于终局**。`recovery.pick()` 按失败原因归类，换一条路再试：
+
+| 失败原因 | 换的策略 | 具体做什么 |
+|---|---|---|
+| 点名了某工具（`create_reminder` / `write_file` …） | `switch_tool` | 换成不依赖它的做法（查 `TOOL_SWAPS` 表） |
+| 缺信息（文件不存在 / 请提供 / 缺少…） | `ask_user` | 转 `asked`，把缺的东西问清楚 |
+| 环境问题（权限 / 超时 / 服务不可用 / 配额） | `narrow` | 缩小范围，先交付能做的并说明 |
+| 其它 | `replan` | 让规划节点换一条完全不同的路线 |
+| 策略用尽（默认 2 次） | `giveup` | 才 `aborted`，结果里写清试过哪些 |
+
+三个容易被忽略的点：
+
+1. **ABORT 只记原因，不判死**。`executor_node` 把原因写进 `goals.last_error`，目标留 `active`，由 worker 决定换哪种策略。
+2. **`ask_user` 是完成路径，不是失败**。问人也是把任务做完的合法方式。
+3. **换策略后 `attempts` 清零**。策略变了，旧的失败计数不该继续压着它。
+
+真机演示（容器内真实模型，失败为注入）：
+
+```
+[worker] 目标 #1 换策略 → switch_tool：建提醒失败就把时间和事项写进回答，让用户手动确认
+[worker] 目标 #1（第 3 次续跑已用尽，换策略后重试）：把今天要做的事整理成三个待办
+→ 状态=asked，result=🤔 今天你想完成哪三件事？
+```
+
+策略全试过才放弃：
+
+```
+状态=aborted | 换过=['switch_tool','ask_user']
+result=换策略仍没做成（已试：换工具、改为提问）。最后一次失败：未知错误
+```
+
+顺带修掉一个信号解析 bug：`_signal()` 原来只认字符串开头的信号，模型"先解释、另起一行写 `ASK:`"会被漏掉、目标被误判 done。已改为 `MULTILINE + search`，并在 `test_react.py` 加了回归断言。
 
 
 ## 🚀 快速开始

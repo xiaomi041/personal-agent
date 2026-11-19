@@ -84,6 +84,11 @@ ok("不带信号 → 空", main._signal("今天多云，17℃") == ("", ""))
 ok("信号必须行首", main._signal("我可以 ASK: 一下吗") == ("", ""), main._signal("我可以 ASK: 一下吗"))
 ok("信号前有空格也认", main._signal("   ASK: 问题") == ("ASK", "问题"))
 ok("小写也认", main._signal("abort: 算了吧") == ("ABORT", "算了吧"))
+# 回归（2026-11-20）：模型常在解释完之后另起一行给信号，只认字符串开头会漏掉，
+# 实测出现过"先解释、再另起一行 ASK:"却被判成正常完成。
+ok("多行回答里另起一行的信号也认",
+   main._signal("我查了，没有这个文件。\n\nASK: 请把 PDF 上传到文档区")[0] == "ASK",
+   main._signal("我查了，没有这个文件。\n\nASK: 请把 PDF 上传到文档区"))
 
 # ---------------- 2. _run_tool_loop 的状态 ----------------
 check("2. 工具循环状态")
@@ -132,8 +137,12 @@ gid2 = goals.add_goal("t-react", "查天气", "①查天气", [])
 install(Script(executor=[AIMessage(content="ABORT: 没有该城市的天气源")]))
 state["goal_id"] = gid2
 out = main.executor_node(state, {"configurable": {"thread_id": "t-react"}})
-ok("ABORT 目标状态记为 aborted", goals.get_goal(gid2)["status"] == "aborted",
+# 语义变更（2026-11-20）：ABORT 不再直接判死，而是把原因记下来、目标留在 active，
+# 交给 worker 按 recovery 表换一种策略重试；只有策略用尽才 aborted。
+ok("ABORT 目标仍是 active（等换策略）", goals.get_goal(gid2)["status"] == "active",
    goals.get_goal(gid2)["status"])
+ok("ABORT 原因被记进 last_error", "没有该城市的天气源" in (goals.get_goal(gid2)["last_error"] or ""),
+   goals.get_goal(gid2)["last_error"])
 ok("ABORT 文本可读", "做不到" in out["execution_result"], out["execution_result"])
 
 gid3 = goals.add_goal("t-react", "查天气", "①查天气", [])
